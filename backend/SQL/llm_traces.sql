@@ -71,3 +71,32 @@ CREATE INDEX IF NOT EXISTS idx_llm_traces_call_type_created_at
 -- =====================================================
 ALTER TABLE llm_traces
     ALTER COLUMN cost_usd TYPE NUMERIC(16,10);
+
+-- =====================================================
+-- Migration (2026-09-01): agent-run structure.
+--
+-- One agent run writes one row per turn, as each turn completes — a run that
+-- crashes still leaves its finished turns behind, which is exactly the data
+-- failure analysis needs. These three columns are what makes those rows
+-- addressable as a run rather than a pile of unrelated calls.
+-- =====================================================
+ALTER TABLE llm_traces
+    -- One complete agent run: one evidence item and all of its turns.
+    -- Aggregate by this for per-run metrics — tool calls, cost, total latency.
+    -- Cannot be reconstructed after the fact: which turns grouped into which
+    -- run is known only at write time.
+    ADD COLUMN IF NOT EXISTS run_id      TEXT,
+
+    -- 1-based turn number within the run. created_at cannot order turns
+    -- reliably — two turns can land in the same millisecond.
+    ADD COLUMN IF NOT EXISTS turn_index  INTEGER,
+
+    -- 'model_done' | 'max_turns' | 'max_tool_calls'. Set ONLY on a run's final
+    -- row, since it is not known until the run ends and this table is
+    -- append-only. Consequence worth keeping: a run_id whose rows all have
+    -- NULL stop_reason is a run that crashed.
+    ADD COLUMN IF NOT EXISTS stop_reason TEXT;
+
+-- Replaying one run in order; also the lookup the trajectory UI does
+CREATE INDEX IF NOT EXISTS idx_llm_traces_run_id_turn
+    ON llm_traces (run_id, turn_index);

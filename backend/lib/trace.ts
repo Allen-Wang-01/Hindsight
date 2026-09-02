@@ -1,4 +1,4 @@
-import crypto from 'crypto'
+import { hashInput } from './hash.js'
 import { db } from '../config/postgres.js'
 import { createLogger } from '../utils/logger.js'
 import { computeCost, PRICING_VERSION } from '../config/modelPricing.js'
@@ -26,6 +26,14 @@ export interface TracePayload {
     schemaVersion?: string
     pricingVersion?: string
 
+    // Agent-run structure. Absent on single-call sites (note_analysis, embeddings).
+    /** One complete agent run — one evidence item and all of its turns. */
+    runId?: string
+    /** 1-based turn number within the run. */
+    turnIndex?: number
+    /** Set only on a run's final row; a run whose rows all lack it is a run that crashed. */
+    stopReason?: string
+
     // Input / output
     input?: unknown
     output?: string
@@ -50,13 +58,8 @@ export interface TracePayload {
     extra?: unknown
 }
 
-/**
- * sha256 hex digest of a text input. Used for input_hash, which also
- * doubles as the embedding cache key.
- */
-export function hashInput(text: string): string {
-    return crypto.createHash('sha256').update(text, 'utf8').digest('hex')
-}
+// Re-exported so existing callers keep importing it from here.
+export { hashInput }
 
 /**
  * Insert one row into llm_traces. Never throws — a failed trace write
@@ -84,6 +87,10 @@ export async function insertTrace(payload: TracePayload): Promise<void> {
             prompt_version: payload.promptVersion,
             schema_version: payload.schemaVersion,
             pricing_version: payload.pricingVersion,
+
+            run_id: payload.runId,
+            turn_index: payload.turnIndex,
+            stop_reason: payload.stopReason,
 
             input: payload.input,
             output: payload.output,
@@ -151,6 +158,10 @@ interface StartTraceMeta {
     input?: unknown       // omitted on the embedding path
     inputChars?: number
     inputHash?: string
+
+    // Agent-run structure; both known before the call starts.
+    runId?: string
+    turnIndex?: number
 }
 
 interface FinishResult {
@@ -160,6 +171,9 @@ interface FinishResult {
     cachedTokens?: number
     retrievalHits?: unknown
     toolCalls?: unknown
+    reasoning?: string
+    /** Only the turn that ends a run passes this; it isn't known any earlier. */
+    stopReason?: string
 }
 
 export interface TraceRecorder {
@@ -224,8 +238,12 @@ export function startTrace(meta: StartTraceMeta): TraceRecorder {
                 output: result.output,
                 inputChars: meta.inputChars,
                 inputHash: meta.inputHash,
+                reasoning: result.reasoning,
                 toolCalls: result.toolCalls,
                 retrievalHits: result.retrievalHits,
+                runId: meta.runId,
+                turnIndex: meta.turnIndex,
+                stopReason: result.stopReason,
                 inputTokens: result.inputTokens,
                 outputTokens: result.outputTokens,
                 totalTokens,
@@ -252,6 +270,8 @@ export function startTrace(meta: StartTraceMeta): TraceRecorder {
                 input: meta.input,
                 inputChars: meta.inputChars,
                 inputHash: meta.inputHash,
+                runId: meta.runId,
+                turnIndex: meta.turnIndex,
                 latencyMs,
                 firstTokenMs,
                 status: 'error',
