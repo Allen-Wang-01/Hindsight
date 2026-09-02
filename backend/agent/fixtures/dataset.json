@@ -1,0 +1,169 @@
+{
+  "_comment": "Hand-written fixture data backing the stub tools. Domain vocabulary lives here, in data, never in code. Record ids are real-format 24-hex ObjectId strings so downstream links are shaped like the real thing. `similarity` is present on records so the stub can bucket it into relatedness and report the raw number to the trace. IMPORTANT: summaries and excerpts name what a record is ABOUT and never what happened in it — a summary that states the conclusion removes the agent's reason to open the record, which is the constraint the whole loop depends on. Keep the diagnosis in `content` only.",
+
+  "records": [
+    {
+      "record_id": "66a1f0c2e4b09a1d3c5f7a01",
+      "occurred_at": "2026-07-03T13:20:00.000Z",
+      "channel": "web",
+      "source_type": "authored",
+      "description": null,
+      "similarity": 0.89,
+      "summary": "Interview debrief. System design round, rate limiting question with a follow-up on algorithm choice.",
+      "content": "Second round, system design. The prompt was rate limiting for a public API.\nI opened with token bucket and covered bucket capacity and refill rate. The interviewer pushed: \"what about leaky bucket, when would you reach for that?\"\nI said leaky bucket smooths bursts by flattening spiky traffic. He didn't respond, just asked \"can't token bucket smooth bursts too?\" I stalled, mumbled \"token bucket is more flexible\" and stopped.\nLooked it up afterwards. Both handle bursts; the real difference is that token bucket lets a burst through once tokens have accumulated, while leaky bucket forces a constant output rate. I had attached the word \"smoothing\" to the wrong one."
+    },
+    {
+      "record_id": "66a1f0c2e4b09a1d3c5f7a02",
+      "occurred_at": "2026-06-18T10:05:00.000Z",
+      "channel": "web",
+      "source_type": "authored",
+      "description": null,
+      "similarity": 0.74,
+      "summary": "Interview debrief. System design round, cache penetration question with a follow-up.",
+      "content": "Got asked about cache penetration. I said use a bloom filter to reject keys that don't exist.\nInterviewer asked \"anything else?\" I drew a blank. He hinted \"what if the lookup comes back empty?\" and only then did I say cache the empty value.\nFeels like I've read this but it isn't reflexive yet. One follow-up and I freeze."
+    },
+    {
+      "record_id": "66a1f0c2e4b09a1d3c5f7a03",
+      "occurred_at": "2026-05-29T09:40:00.000Z",
+      "channel": "web",
+      "source_type": "authored",
+      "description": null,
+      "similarity": 0.61,
+      "summary": "Interview debrief. System design round, database sharding question with a follow-up on resharding.",
+      "content": "Sharding question went fine.\nStarted with hashing on user id, then raised unprompted that sharding by time creates a hotspot because the newest shard takes all the write pressure.\nInterviewer nodded and asked about resharding. I covered consistent hashing and dual-write migration. Counting this one as a pass."
+    },
+    {
+      "record_id": "66a1f0c2e4b09a1d3c5f7a04",
+      "occurred_at": "2026-07-21T20:15:00.000Z",
+      "channel": "mcp",
+      "source_type": "saved",
+      "description": "Rate limiting still hasn't clicked, saving this to work through later",
+      "similarity": 0.93,
+      "summary": "Saved article, \"Rate Limiting in Practice\", covering the common rate limiting algorithms.",
+      "content": "Rate Limiting in Practice\n\nToken bucket and leaky bucket are the pair most often conflated, and the difference comes down to how each one treats a burst.\nLeaky bucket drains at a fixed rate. Bursts queue inside the bucket and the output curve stays flat — it trades burst responsiveness for absolute downstream stability.\nToken bucket instead lets a burst through in one go once enough tokens have accrued, as long as the long-run average stays within budget. For a user-facing API, token bucket is almost always the better fit.\nSliding window counters apply when..."
+    },
+    {
+      "record_id": "66a1f0c2e4b09a1d3c5f7a05",
+      "occurred_at": "2026-08-05T22:30:00.000Z",
+      "channel": "web",
+      "source_type": "authored",
+      "description": null,
+      "similarity": 0.81,
+      "summary": "Study log. Hands-on work on a rate limiting implementation and its parameters.",
+      "content": "Wrote a token bucket limiter with Redis and Lua.\nBucket capacity decides how large a burst you can absorb, refill rate decides long-run throughput, and they are two separate knobs — I had been thinking of it as a single \"rate limit\" number.\nLoad tested with capacity 100 and rate 10/s. The first 100 requests all went through instantly, then it settled to 10 per second. Burst behaviour and steady-state behaviour are obvious once you watch it."
+    },
+    {
+      "record_id": "66a1f0c2e4b09a1d3c5f7a06",
+      "occurred_at": "2026-04-11T15:00:00.000Z",
+      "channel": "web",
+      "source_type": "authored",
+      "description": null,
+      "similarity": 0.42,
+      "summary": "Study log. Reading notes on the CAP theorem.",
+      "content": "CAP: consistency, availability, partition tolerance. Partition tolerance isn't optional in a distributed system, so the real choice is CP or AP."
+    }
+  ],
+
+  "units": [
+    { "unit_type": "dimension", "unit_id": "u_dim_001", "name": "system design" },
+    { "unit_type": "dimension", "unit_id": "u_dim_002", "name": "behavioral" },
+    { "unit_type": "subject", "unit_id": "u_sub_001", "name": "rate limiting" },
+    { "unit_type": "subject", "unit_id": "u_sub_002", "name": "caching" }
+  ],
+
+  "evidence": {
+    "u_dim_001": [
+      {
+        "record_id": "66a1f0c2e4b09a1d3c5f7a03",
+        "occurred_at": "2026-05-29T09:40:00.000Z",
+        "outcome": "answered",
+        "difficulty": "medium",
+        "channel": "web",
+        "excerpt": "Database sharding question, with a follow-up on resharding."
+      },
+      {
+        "record_id": "66a1f0c2e4b09a1d3c5f7a02",
+        "occurred_at": "2026-06-18T10:05:00.000Z",
+        "outcome": "partial",
+        "difficulty": "medium",
+        "channel": "web",
+        "excerpt": "Cache penetration question, with a follow-up."
+      },
+      {
+        "record_id": "66a1f0c2e4b09a1d3c5f7a01",
+        "occurred_at": "2026-07-03T13:20:00.000Z",
+        "outcome": "partial",
+        "difficulty": "medium",
+        "channel": "web",
+        "excerpt": "Rate limiting question, with a follow-up comparing two algorithms."
+      }
+    ],
+    "u_dim_002": [],
+    "u_sub_001": [
+      {
+        "record_id": "66a1f0c2e4b09a1d3c5f7a01",
+        "occurred_at": "2026-07-03T13:20:00.000Z",
+        "outcome": "partial",
+        "difficulty": "medium",
+        "channel": "web",
+        "excerpt": "Rate limiting question, with a follow-up comparing two algorithms."
+      }
+    ],
+    "u_sub_002": [
+      {
+        "record_id": "66a1f0c2e4b09a1d3c5f7a02",
+        "occurred_at": "2026-06-18T10:05:00.000Z",
+        "outcome": "partial",
+        "difficulty": "medium",
+        "channel": "web",
+        "excerpt": "Cache penetration question, with a follow-up."
+      }
+    ]
+  },
+
+  "distribution": [
+    { "dimension": "system design", "name": "rate limiting", "count": 3, "last_seen": "2026-08-05T22:30:00.000Z" },
+    { "dimension": "system design", "name": "caching", "count": 2, "last_seen": "2026-06-18T10:05:00.000Z" },
+    { "dimension": "system design", "name": "sharding", "count": 1, "last_seen": "2026-05-29T09:40:00.000Z" },
+    { "dimension": "distributed systems", "name": "CAP", "count": 1, "last_seen": "2026-04-11T15:00:00.000Z" }
+  ],
+
+  "inputs": [
+    {
+      "id": "deep",
+      "note": "Expect: get_unit_history surfaces the 2026-07-03 rate limiting entry, then get_record to read what was actually said. Same gap recurring, not a new one.",
+      "evidence": {
+        "unit_type": "dimension",
+        "unit": "system design",
+        "outcome": "partial",
+        "difficulty": "medium",
+        "occurred_at": "2026-08-20T14:00:00.000Z",
+        "excerpt": "Asked to design rate limiting, led with token bucket, could not articulate how it differs from leaky bucket."
+      }
+    },
+    {
+      "id": "no-history",
+      "note": "Expect: get_unit_history returns count 0. The agent should establish a new unit with concrete numbers rather than claim a regression.",
+      "evidence": {
+        "unit_type": "dimension",
+        "unit": "behavioral",
+        "outcome": "partial",
+        "difficulty": "medium",
+        "occurred_at": "2026-08-22T11:30:00.000Z",
+        "excerpt": "Asked to describe a conflict with a coworker; told it as a sequence of events without explaining any of my own decisions."
+      }
+    },
+    {
+      "id": "saved-trap",
+      "note": "Expect: a search surfaces the saved article 66a1f0c2e4b09a1d3c5f7a04. The agent must not read it as the user's own performance.",
+      "evidence": {
+        "unit_type": "subject",
+        "unit": "rate limiting",
+        "outcome": "answered",
+        "difficulty": "medium",
+        "occurred_at": "2026-08-24T16:45:00.000Z",
+        "excerpt": "Rate limiting went smoothly this time; explained unprompted how token bucket and leaky bucket treat bursts differently."
+      }
+    }
+  ]
+}

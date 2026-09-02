@@ -12,6 +12,11 @@ export interface ModelPrice {
 export const PRICING_VERSION = '2026-08'
 
 export const MODEL_PRICING: Record<string, ModelPrice> = {
+    'gpt-5.6-luna': {
+        input: 0.20,
+        cachedInput: 0.02,
+        output: 1.20,
+    },
     'gpt-5-nano': {
         input: 0.05,
         cachedInput: 0.005,
