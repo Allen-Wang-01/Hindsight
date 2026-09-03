@@ -13,6 +13,7 @@
  *   npx tsx scripts/runAgentLoop.ts --model gpt-5-nano  # override the model
  *   npx tsx scripts/runAgentLoop.ts --max-turns 3       # squeeze the budget
  *   npx tsx scripts/runAgentLoop.ts --max-output-tokens 200  # force a truncated turn
+ *   npx tsx scripts/runAgentLoop.ts --cancel-after 4000      # cancel mid-run
  *   npx tsx scripts/runAgentLoop.ts --json              # machine-readable, no streaming
  *
  * Requires OPENAI_API_KEY in .env. Writes nothing to any database — trace
@@ -41,6 +42,7 @@ const model = arg('model') ?? DEFAULT_MODEL
 const maxTurns = arg('max-turns')
 const maxToolCalls = arg('max-tool-calls')
 const maxOutputTokens = arg('max-output-tokens')
+const cancelAfter = arg('cancel-after')
 
 const budget = {
     maxTurns: maxTurns ? Number(maxTurns) : DEFAULT_BUDGET.maxTurns,
@@ -122,6 +124,13 @@ function createHooks(): AgentHooks {
 
 function printRunFooter(result: AgentRunResult): void {
     const t = result.totals
+
+    if (result.stopReason === 'aborted') {
+        console.log(
+            `\n${RED}✗ cancelled — the loop stopped at its next checkpoint. ` +
+            `The cost below is everything this run spent.${RESET}`
+        )
+    }
 
     // Loud on purpose: a truncated run ends mid-sentence, and that is easy to
     // mistake for a terse conclusion when it scrolls past in dim grey.
@@ -205,13 +214,25 @@ async function main(): Promise<void> {
             console.log(`${DIM}expected: ${input.note}${RESET}`)
         }
 
+        // A real AbortController on the real code path — the cancellation
+        // scenario needs no injection, which is the point of demoing it.
+        const controller = new AbortController()
+        const cancelTimer = cancelAfter
+            ? setTimeout(() => {
+                process.stdout.write(`\n\n${RED}⏹ cancelling at ${cancelAfter}ms${RESET}\n`)
+                controller.abort()
+            }, Number(cancelAfter))
+            : undefined
+
         const result = await runAgent({
             input,
             model,
             budget,
             ...(maxOutputTokens ? { maxOutputTokens: Number(maxOutputTokens) } : {}),
+            ...(cancelAfter ? { signal: controller.signal } : {}),
             ...(wantsJson ? {} : { hooks: createHooks() }),
         })
+        if (cancelTimer) clearTimeout(cancelTimer)
         results.push(result)
 
         if (!wantsJson) {

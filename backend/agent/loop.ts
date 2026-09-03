@@ -26,7 +26,35 @@ import {
     buildEvidenceMessage,
 } from './prompt.js'
 
-const client = new OpenAI()
+/**
+ * The one SDK method this loop calls. Narrow on purpose: a test satisfies it
+ * with an object literal replaying a scripted event sequence.
+ */
+export interface AgentClient {
+    responses: {
+        create(
+            request: OpenAI.Responses.ResponseCreateParamsStreaming,
+            options?: { signal?: AbortSignal }
+        ): Promise<AsyncIterable<OpenAI.Responses.ResponseStreamEvent>>
+    }
+}
+
+/**
+ * The SDK default is 10 minutes — long enough for stuck requests to stall every
+ * worker slot. Bounds connecting and time-to-headers only: the SDK clears the
+ * timer once headers arrive, which for a stream is before generation finishes.
+ * A stream stalling midway is handled in this file instead.
+ */
+const AGENT_REQUEST_TIMEOUT_MS = 60_000
+
+/** Built on first use: `new OpenAI()` throws without an API key, which would
+ *  make merely importing this file fail in tests that never hit the network. */
+let defaultClient: AgentClient | undefined
+
+function getDefaultClient(): AgentClient {
+    defaultClient ??= new OpenAI({ timeout: AGENT_REQUEST_TIMEOUT_MS })
+    return defaultClient
+}
 
 export const DEFAULT_MODEL = 'gpt-5.6-luna'
 
@@ -47,6 +75,7 @@ export type StopReason =
     | 'max_turns'
     | 'max_tool_calls'
     | 'incomplete'      // the provider cut the response short — see stopDetail
+    | 'aborted'         // cancelled through the caller's signal
 
 export interface ToolCallRecord {
     turn: number
@@ -74,6 +103,10 @@ export interface TurnRecord {
     latencyMs: number
     /** Time to the first visible token. Null when nothing was streamed. */
     firstTokenMs: number | null
+    /** Model calls this turn cost, including retries. 1 when nothing went wrong.
+     *  Only the surviving attempt's tokens are counted — the provider bills the
+     *  abandoned ones too, so this is an undercount worth seeing. */
+    attempts: number
 }
 
 export interface AgentTotals {
@@ -98,6 +131,33 @@ export interface AgentHooks {
     onTurnEnd?: (turn: TurnRecord) => void
     onToolStart?: (name: string) => void
     onToolEnd?: (call: ToolCallRecord) => void
+    onStreamRetry?: (retry: StreamRetry) => void
+}
+
+/**
+ * A model call that died mid-stream and is about to be made again. Whoever is
+ * rendering has already received deltas from the dead attempt: `discardedChars`
+ * says how much to throw away before the retry starts producing text.
+ */
+export interface StreamRetry {
+    /** The attempt that just failed, 1-based. */
+    attempt: number
+    reason: string
+    delayMs: number
+    /** Characters handed to onTextDelta by the failed attempt. */
+    discardedChars: number
+}
+
+/** Backoff before each retry. Length + 1 is the attempt ceiling. */
+export const DEFAULT_RETRY_DELAYS_MS = [500, 1500]
+
+function sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+/** ±20% around the base delay, so concurrent runs do not retry in lockstep. */
+function jitter(baseMs: number): number {
+    return Math.round(baseMs * (0.8 + Math.random() * 0.4))
 }
 
 export interface AgentRunResult {
@@ -191,56 +251,112 @@ interface ModelCall {
      * separates "the model finished" from "the model was interrupted".
      */
     incompleteReason: string | null
+    attempts: number
 }
 
 /**
- * One streamed model call. Streaming is not decoration: without it there is a
- * 30-second silence per turn with nothing to show, and the reasoning text is
- * meant to be watched as it arrives. Deltas go to the hook; the final Response
- * arrives on the completed event and is parsed exactly as a non-streamed one.
+ * One streamed model call, retried when the stream dies. Streaming is not
+ * decoration: without it there is a 30-second silence per turn with nothing to
+ * show, and the reasoning text is meant to be watched as it arrives. Deltas go
+ * to the hook; the final Response arrives on the completed event and is parsed
+ * exactly as a non-streamed one.
+ *
+ * Retries here cover exactly one gap: the SDK stops retrying once the response
+ * headers are in, so a stream that dies halfway is the caller's problem. Errors
+ * raised while opening the request are left alone — the SDK has already retried
+ * those, and stacking a second layer on top multiplies the attempts.
+ *
+ * Returns null when the run was cancelled. The half-finished response is thrown
+ * away rather than reported: it has no usage and no conclusion.
  */
 async function callModel(
+    client: AgentClient,
     request: OpenAI.Responses.ResponseCreateParamsStreaming,
-    hooks: AgentHooks | undefined
-): Promise<ModelCall> {
+    hooks: AgentHooks | undefined,
+    retryDelaysMs: number[],
+    signal: AbortSignal | undefined
+): Promise<ModelCall | null> {
     const startedAt = Date.now()
-    let firstTokenAt: number | null = null
-    let final: OpenAI.Responses.Response | undefined
-    // Tracked separately from `final`: an incomplete response and a completed
-    // one are both terminal and both parseable, and the response object alone
-    // does not say which event delivered it.
-    let incomplete = false
 
-    const stream = await client.responses.create(request)
+    for (let attempt = 1; ; attempt++) {
+        if (signal?.aborted) return null
+        let firstTokenAt: number | null = null
+        let final: OpenAI.Responses.Response | undefined
+        // Tracked separately from `final`: an incomplete response and a
+        // completed one are both terminal and both parseable, and the response
+        // object alone does not say which event delivered it.
+        let incomplete = false
+        let streamedChars = 0
+        let failure: string | null = null
 
-    for await (const event of stream) {
-        if (event.type === 'response.output_text.delta') {
-            if (firstTokenAt === null) firstTokenAt = Date.now()
-            hooks?.onTextDelta?.(event.delta)
-        } else if (event.type === 'response.completed') {
-            final = event.response
-        } else if (event.type === 'response.incomplete') {
-            final = event.response
-            incomplete = true
-        } else if (event.type === 'response.failed') {
-            final = event.response
+        // Opening the stream is the SDK's layer: it has already retried what it
+        // is willing to retry, so anything thrown here goes straight up. The one
+        // exception is cancellation, which surfaces as an abort error.
+        let stream: AsyncIterable<OpenAI.Responses.ResponseStreamEvent>
+        try {
+            stream = await client.responses.create(request, { signal })
+        } catch (err) {
+            if (signal?.aborted) return null
+            throw err
         }
-    }
 
-    if (!final) {
-        throw new Error('stream ended without a terminal response event')
-    }
-    if (final.error) {
-        throw new Error(`model call failed: ${final.error.message}`)
-    }
+        try {
+            for await (const event of stream) {
+                if (event.type === 'response.output_text.delta') {
+                    if (firstTokenAt === null) firstTokenAt = Date.now()
+                    streamedChars += event.delta.length
+                    hooks?.onTextDelta?.(event.delta)
+                } else if (event.type === 'response.completed') {
+                    final = event.response
+                } else if (event.type === 'response.incomplete') {
+                    final = event.response
+                    incomplete = true
+                } else if (event.type === 'response.failed') {
+                    final = event.response
+                }
+            }
+            if (!final) {
+                failure = 'stream ended without a terminal response event'
+            } else if (final.error) {
+                failure = `model call failed: ${final.error.message}`
+            }
+        } catch (err) {
+            failure = `stream interrupted: ${err instanceof Error ? err.message : String(err)}`
+        }
 
-    return {
-        parsed: parseResponse(final),
-        firstTokenMs: firstTokenAt === null ? null : firstTokenAt - startedAt,
-        latencyMs: Date.now() - startedAt,
-        // The reason is what makes the truncation actionable; without it the
-        // trace records that something was cut off but not by which limit.
-        incompleteReason: incomplete ? final.incomplete_details?.reason ?? 'unknown' : null,
+        // Checked before the failure is classified: a cancelled stream ends
+        // silently with no terminal event, which is indistinguishable from an
+        // interruption. Without this, cancelling would buy three retries first.
+        if (signal?.aborted) return null
+
+        if (failure === null && final) {
+            return {
+                parsed: parseResponse(final),
+                firstTokenMs: firstTokenAt === null ? null : firstTokenAt - startedAt,
+                latencyMs: Date.now() - startedAt,
+                // The reason is what makes the truncation actionable; without
+                // it the trace records that something was cut off but not by
+                // which limit. Never retried: the same ceiling would truncate
+                // the retry too, at full price.
+                incompleteReason: incomplete
+                    ? final.incomplete_details?.reason ?? 'unknown'
+                    : null,
+                attempts: attempt,
+            }
+        }
+
+        if (attempt > retryDelaysMs.length) {
+            throw new Error(`${failure} (gave up after ${attempt} attempts)`)
+        }
+
+        const delayMs = jitter(retryDelaysMs[attempt - 1] ?? 0)
+        hooks?.onStreamRetry?.({
+            attempt,
+            reason: failure ?? 'unknown',
+            delayMs,
+            discardedChars: streamedChars,
+        })
+        await sleep(delayMs)
     }
 }
 
@@ -256,6 +372,17 @@ export interface RunAgentParams {
      * runs would interfere.
      */
     maxOutputTokens?: number
+    /** Defaults to the shared client. Injected by tests and by callers that
+     *  need their own SDK configuration. */
+    client?: AgentClient
+    /** Overrides DEFAULT_RETRY_DELAYS_MS. Scoped to one run; tests pass zeros. */
+    retryDelaysMs?: number[]
+    /**
+     * Cancellation. Aborting stops the loop at the next checkpoint and returns
+     * a normal result with stopReason 'aborted' — no throw, because the caller
+     * still needs the bill for what was already spent.
+     */
+    signal?: AbortSignal
 }
 
 export async function runAgent({
@@ -264,6 +391,9 @@ export async function runAgent({
     budget = DEFAULT_BUDGET,
     hooks,
     maxOutputTokens,
+    client = getDefaultClient(),
+    retryDelaysMs = DEFAULT_RETRY_DELAYS_MS,
+    signal,
 }: RunAgentParams): Promise<AgentRunResult> {
     const startedAt = Date.now()
 
@@ -286,6 +416,13 @@ export async function runAgent({
         : { max_output_tokens: maxOutputTokens }
 
     while (true) {
+        // Cancellation checkpoint. First, so a run cancelled between turns does
+        // not pay for one more.
+        if (signal?.aborted) {
+            stopReason = 'aborted'
+            break
+        }
+
         // Budget checks come before the call, so an exhausted budget costs one
         // convergence call rather than a wasted round trip with tools attached.
         if (turnIndex >= budget.maxTurns) {
@@ -300,7 +437,8 @@ export async function runAgent({
         turnIndex += 1
         hooks?.onTurnStart?.(turnIndex)
 
-        const { parsed, firstTokenMs, latencyMs, incompleteReason } = await callModel(
+        const call = await callModel(
+            client,
             {
                 model,
                 input: conversation,
@@ -311,8 +449,18 @@ export async function runAgent({
                 stream: true,
                 ...outputCeiling,
             },
-            hooks
+            hooks,
+            retryDelaysMs,
+            signal
         )
+
+        // Cancelled mid-stream. The turn is dropped: no usage, no conclusion.
+        if (call === null) {
+            stopReason = 'aborted'
+            break
+        }
+
+        const { parsed, firstTokenMs, latencyMs, incompleteReason, attempts } = call
 
         conversation.push(...parsed.historyItems)
 
@@ -332,6 +480,7 @@ export async function runAgent({
             }),
             latencyMs,
             firstTokenMs,
+            attempts,
         }
         turns.push(turn)
         hooks?.onTurnEnd?.(turn)
@@ -352,6 +501,14 @@ export async function runAgent({
         }
 
         for (const call of parsed.functionCalls) {
+            // Cancellation checkpoint. A tool that has not started is not worth
+            // starting; one already running is left to finish, since the stubs
+            // are local and the real queries will be short.
+            if (signal?.aborted) {
+                stopReason = 'aborted'
+                break
+            }
+
             hooks?.onToolStart?.(call.name)
             const callStartedAt = Date.now()
             let parsedArguments: unknown = call.rawArguments
@@ -410,6 +567,15 @@ export async function runAgent({
                 output: JSON.stringify(output),
             })
         }
+
+        // Carries the tool-loop break outward.
+        if (stopReason === 'aborted') break
+    }
+
+    // Cancellation checkpoint. A cancelled run gets no convergence call — the
+    // point of cancelling is that the spending stops.
+    if (signal?.aborted) {
+        stopReason = 'aborted'
     }
 
     // Forced convergence. Tools are withheld rather than merely discouraged, so
@@ -418,7 +584,8 @@ export async function runAgent({
         conversation.push({ role: 'user', content: CONVERGE_MESSAGE })
         hooks?.onTurnStart?.(turnIndex + 1)
 
-        const { parsed, firstTokenMs, latencyMs, incompleteReason } = await callModel(
+        const call = await callModel(
+            client,
             {
                 model,
                 input: conversation,
@@ -427,35 +594,46 @@ export async function runAgent({
                 stream: true,
                 ...outputCeiling,
             },
-            hooks
+            hooks,
+            retryDelaysMs,
+            signal
         )
 
-        // A truncated conclusion is not a converged one. The budget reason is
-        // overwritten because this is the more serious of the two.
-        if (incompleteReason !== null) {
-            stopReason = 'incomplete'
-            stopDetail = incompleteReason
-        }
+        if (call === null) {
+            // Cancelled while converging: the budget reason is replaced, since
+            // what actually ended the run is the cancellation.
+            stopReason = 'aborted'
+        } else {
+            const { parsed, firstTokenMs, latencyMs, incompleteReason, attempts } = call
 
-        const turn: TurnRecord = {
-            turn: turnIndex + 1,
-            text: parsed.text,
-            toolCalls: [],
-            inputTokens: parsed.inputTokens,
-            outputTokens: parsed.outputTokens,
-            cachedTokens: parsed.cachedTokens,
-            reasoningTokens: parsed.reasoningTokens,
-            costUsd: computeCost({
-                model,
+            // A truncated conclusion is not a converged one. The budget reason
+            // is overwritten because this is the more serious of the two.
+            if (incompleteReason !== null) {
+                stopReason = 'incomplete'
+                stopDetail = incompleteReason
+            }
+
+            const turn: TurnRecord = {
+                turn: turnIndex + 1,
+                text: parsed.text,
+                toolCalls: [],
                 inputTokens: parsed.inputTokens,
                 outputTokens: parsed.outputTokens,
                 cachedTokens: parsed.cachedTokens,
-            }),
-            latencyMs,
-            firstTokenMs,
+                reasoningTokens: parsed.reasoningTokens,
+                costUsd: computeCost({
+                    model,
+                    inputTokens: parsed.inputTokens,
+                    outputTokens: parsed.outputTokens,
+                    cachedTokens: parsed.cachedTokens,
+                }),
+                latencyMs,
+                firstTokenMs,
+                attempts,
+            }
+            turns.push(turn)
+            hooks?.onTurnEnd?.(turn)
         }
-        turns.push(turn)
-        hooks?.onTurnEnd?.(turn)
     }
 
     const pricedTurns = turns.filter(t => t.costUsd !== null)

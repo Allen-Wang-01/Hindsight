@@ -91,10 +91,16 @@ ALTER TABLE llm_traces
     -- reliably — two turns can land in the same millisecond.
     ADD COLUMN IF NOT EXISTS turn_index  INTEGER,
 
-    -- 'model_done' | 'max_turns' | 'max_tool_calls'. Set ONLY on a run's final
-    -- row, since it is not known until the run ends and this table is
-    -- append-only. Consequence worth keeping: a run_id whose rows all have
-    -- NULL stop_reason is a run that crashed.
+    -- 'model_done' | 'max_turns' | 'max_tool_calls' | 'incomplete' | 'aborted'.
+    -- The last two are not clean endings: 'incomplete' means the provider cut
+    -- the output short (which limit is in the run's stopDetail), 'aborted'
+    -- means the caller cancelled. Set ONLY on a run's final row, since it is
+    -- not known until the run ends and this table is append-only.
+    --
+    -- Two consequences worth keeping. A run_id whose rows all have NULL
+    -- stop_reason is a run that crashed. A cancelled run leaves NO rows at all
+    -- when nothing had finished yet — the in-flight turn is discarded, so it
+    -- never becomes a row.
     ADD COLUMN IF NOT EXISTS stop_reason TEXT;
 
 -- Replaying one run in order; also the lookup the trajectory UI does
