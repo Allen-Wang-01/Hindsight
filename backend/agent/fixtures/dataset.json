@@ -53,6 +53,16 @@
       "content": "Wrote a token bucket limiter with Redis and Lua.\nBucket capacity decides how large a burst you can absorb, refill rate decides long-run throughput, and they are two separate knobs — I had been thinking of it as a single \"rate limit\" number.\nLoad tested with capacity 100 and rate 10/s. The first 100 requests all went through instantly, then it settled to 10 per second. Burst behaviour and steady-state behaviour are obvious once you watch it."
     },
     {
+      "record_id": "66a1f0c2e4b09a1d3c5f7a07",
+      "occurred_at": "2026-08-12T21:10:00.000Z",
+      "channel": "web",
+      "source_type": "authored",
+      "description": null,
+      "similarity": 0.83,
+      "summary": "Interview debrief. Full write-up of a mock system design round on feed design, covering fanout, caching, pagination and ranking.",
+      "content": "Full write-up of tonight's mock with M. Keeping the whole thing this time instead of the usual two lines, because the parts I got wrong were spread across the hour and I want to be able to reread them in order.\n\nPROMPT. Design the home feed for a social app. Ten million daily actives, average two hundred follows per user, and a long tail of accounts with a few million followers each. Reads far outnumber writes.\n\nREQUIREMENTS. Spent about four minutes here. Asked whether the feed had to be ranked or chronological; he said start chronological and we can talk about ranking if there is time. Asked how stale a feed is allowed to be and he said seconds, not minutes. Asked whether deletes have to propagate immediately and he said treat that as a stretch goal. This part went well, he wrote something down.\n\nESTIMATES. Ten million actives posting roughly once a day is about a hundred writes a second on average, call it a thousand at peak. Each user opens the app maybe ten times a day, so a thousand reads a second average and ten thousand at peak. He accepted the numbers without pushing, which I read as him not caring much about this section.\n\nFANOUT. This was the core of the round and the part I lost. I described fanout on write: when someone posts, push the post id into every follower's feed list, so a read becomes a single range scan over a precomputed list. He asked what happens when one of the million-follower accounts posts. I said you would be writing a million entries at once and that is a spike. He asked what I would do about it. I said queue it and process it asynchronously. He asked what the user sees while the queue drains. I stalled. Eventually I said \"they would see the post late\". He waited. I did not say the thing I actually know, which is that you go hybrid: fanout on write for ordinary accounts, fanout on read for the celebrity tail, and merge the two lists at read time. I remembered it walking to the station.\n\nHe moved on rather than dragging it out of me, which I think means he had already made up his mind about that part.\n\nSTORAGE. Posts in one table keyed by post id; feed lists in Redis as sorted sets keyed by user id with the timestamp as the score. He asked how large those lists get. I said cap each one at some number of entries, maybe eight hundred, and page back to the posts table for anything older. He liked that one, he said most people forget the cap.\n\nCACHING. He asked what I would cache besides the feed lists. I said the post bodies themselves, keyed by post id, since one popular post gets read by everyone who follows the author. He asked about invalidation on edit and delete. I said delete the key on write and let the next read repopulate it. He asked what happens between the delete and the repopulate under heavy read load. I said \"a stampede\", and then, after a prompt, that you would use a lock or single-flight so only one request goes to the database and the rest wait on it. That came out slowly, but it came out.\n\nPAGINATION. He asked how the client pages through the feed. I said offset and limit. He asked what happens when new posts arrive between page one and page two. I saw it immediately: you get duplicates and shifted items, so you page on a cursor, the score of the last item you saw, rather than an offset. I should have led with the cursor instead of being walked to it.\n\nRANKING. Ten minutes left. He asked how I would add ranking on top of this. I said you score candidates on recency, affinity to the author and engagement, and that the candidate set has to stay small so the scoring runs over a few hundred items rather than the whole list. He asked where the model would live. I said a separate service the feed calls in batches. Thin, but not wrong.\n\nFAILURE. Last question: the fanout queue is backed up by thirty minutes, what do you do. I said fall back to fanout on read for everyone until it drains. He asked what that costs. I said much more expensive reads, and that you want a flag you can flip rather than a deploy. He seemed fine with that.\n\nWHAT TO FIX. One: I know the hybrid fanout answer and did not produce it under pressure. That is the second time something I have read has failed to arrive when asked for. Two: I default to the naive version, plain fanout on write and offset paging, and only reach the right answer when pushed, which from the other side of the table looks identical to not knowing it. Three: the ranking section was vague because I have never actually built one, and no amount of reading is going to fix that particular gap."
+    },
+    {
       "record_id": "66a1f0c2e4b09a1d3c5f7a06",
       "occurred_at": "2026-04-11T15:00:00.000Z",
       "channel": "web",
@@ -96,6 +106,14 @@
         "difficulty": "medium",
         "channel": "web",
         "excerpt": "Rate limiting question, with a follow-up comparing two algorithms."
+      },
+      {
+        "record_id": "66a1f0c2e4b09a1d3c5f7a07",
+        "occurred_at": "2026-08-12T21:10:00.000Z",
+        "outcome": "partial",
+        "difficulty": "hard",
+        "channel": "web",
+        "excerpt": "Feed design question, with follow-ups on fanout, caching, pagination and ranking."
       }
     ],
     "u_dim_002": [],
@@ -125,6 +143,7 @@
     { "dimension": "system design", "name": "rate limiting", "count": 3, "last_seen": "2026-08-05T22:30:00.000Z" },
     { "dimension": "system design", "name": "caching", "count": 2, "last_seen": "2026-06-18T10:05:00.000Z" },
     { "dimension": "system design", "name": "sharding", "count": 1, "last_seen": "2026-05-29T09:40:00.000Z" },
+    { "dimension": "system design", "name": "feed design", "count": 1, "last_seen": "2026-08-12T21:10:00.000Z" },
     { "dimension": "distributed systems", "name": "CAP", "count": 1, "last_seen": "2026-04-11T15:00:00.000Z" }
   ],
 

@@ -14,14 +14,24 @@
  *   npx tsx scripts/runAgentLoop.ts --max-turns 3       # squeeze the budget
  *   npx tsx scripts/runAgentLoop.ts --max-output-tokens 200  # force a truncated turn
  *   npx tsx scripts/runAgentLoop.ts --cancel-after 4000      # cancel mid-run
+ *   npx tsx scripts/runAgentLoop.ts --max-cost 0.001    # trip the cost ceiling
+ *   npx tsx scripts/runAgentLoop.ts --log               # structured logs alongside the trajectory
  *   npx tsx scripts/runAgentLoop.ts --json              # machine-readable, no streaming
+ *
+ * Fault injection (requires AGENT_FAULT_INJECTION=on in .env), repeatable:
+ *   --fault tool-error:get_record:invalid_argument   # model has to correct itself
+ *   --fault tool-timeout:search_records --tool-timeout 1500
+ *   --fault stream-interrupt:2                       # turn 2's stream dies, then retries
  *
  * Requires OPENAI_API_KEY in .env. Writes nothing to any database — trace
  * persistence arrives in step B.
  */
 import 'dotenv/config'
-import { DEFAULT_BUDGET, DEFAULT_MODEL, runAgent } from '../agent/loop.js'
+import { createFaultPlan, isFaultInjectionEnabled, parseFault } from '../agent/faults.js'
+import type { Fault } from '../agent/faults.js'
+import { DEFAULT_BUDGET, DEFAULT_MODEL, SILENT_LOGGER, runAgent } from '../agent/loop.js'
 import type { AgentHooks, AgentRunResult, TurnRecord } from '../agent/loop.js'
+import { createLogger } from '../utils/logger.js'
 import { fixtureInputs } from '../agent/tools/stubs.js'
 
 const DIM = '\x1b[2m'
@@ -36,18 +46,37 @@ function arg(name: string): string | undefined {
     return index === -1 ? undefined : process.argv[index + 1]
 }
 
+/** Repeatable flag: every `--name value` pair on the command line. */
+function repeatedArg(name: string): string[] {
+    const values: string[] = []
+    process.argv.forEach((token, index) => {
+        if (token !== `--${name}`) return
+        const value = process.argv[index + 1]
+        if (value) values.push(value)
+    })
+    return values
+}
+
 const wantsJson = process.argv.includes('--json')
+const wantsLog = process.argv.includes('--log')
 const only = arg('input')
 const model = arg('model') ?? DEFAULT_MODEL
 const maxTurns = arg('max-turns')
 const maxToolCalls = arg('max-tool-calls')
+const maxCost = arg('max-cost')
 const maxOutputTokens = arg('max-output-tokens')
 const cancelAfter = arg('cancel-after')
+const toolTimeout = arg('tool-timeout')
+const faultSpecs = repeatedArg('fault')
 
 const budget = {
     maxTurns: maxTurns ? Number(maxTurns) : DEFAULT_BUDGET.maxTurns,
     maxToolCalls: maxToolCalls ? Number(maxToolCalls) : DEFAULT_BUDGET.maxToolCalls,
+    maxCostUsd: maxCost ? Number(maxCost) : DEFAULT_BUDGET.maxCostUsd,
 }
+
+// Off by default, so the trajectory is not interleaved with log lines.
+const logger = wantsLog ? createLogger('agent') : SILENT_LOGGER
 
 function money(value: number | null): string {
     return value === null ? 'unpriced' : `$${value.toFixed(6)}`
@@ -111,16 +140,28 @@ function createHooks(): AgentHooks {
                 `\r\x1b[2K  ${status} ${BOLD}${call.name}${RESET}${DIM}(${args}) ${call.durationMs}ms${RESET}\n`
             )
         },
+        onStreamRetry(retry) {
+            // The half-sentence above stays on screen; saying so is the point of
+            // the scenario — this is what the frontend has to survive.
+            process.stdout.write(
+                `\n${RED}✗ stream died mid-flight (${retry.reason})${RESET}\n` +
+                `${DIM}  the ${retry.discardedChars} characters above are discarded; ` +
+                `retrying in ${retry.delayMs}ms${RESET}\n`
+            )
+        },
         onTurnEnd(turn) {
             if (!sawText) {
                 process.stdout.write(`${DIM}  (no narration this turn)${RESET}\n`)
             } else {
                 process.stdout.write('\n')
             }
-            process.stdout.write(`${DIM}  ${turnMeta(turn)}${RESET}\n`)
+            const attempts = turn.attempts > 1 ? ` · ${turn.attempts} attempts` : ''
+            process.stdout.write(`${DIM}  ${turnMeta(turn)}${attempts}${RESET}\n`)
         },
     }
 }
+
+const BUDGET_STOPS: AgentRunResult['stopReason'][] = ['max_turns', 'max_tool_calls', 'max_cost']
 
 function printRunFooter(result: AgentRunResult): void {
     const t = result.totals
@@ -139,6 +180,21 @@ function printRunFooter(result: AgentRunResult): void {
             `\n${RED}✗ output truncated (${result.stopDetail}) — ` +
             `the text above stops wherever the limit hit, it is not a conclusion${RESET}`
         )
+    }
+
+    // Yellow, not red: running out of budget is a degradation, not a failure.
+    if (BUDGET_STOPS.includes(result.stopReason)) {
+        console.log(
+            `\n${YELLOW}⚠ budget reached (${result.stopReason}) — the conclusion above came from ` +
+            `forced convergence, with tools withheld${RESET}`
+        )
+    }
+
+    if (result.injectedFaults.length > 0) {
+        const fired = result.injectedFaults
+            .map(fault => `${fault.kind}${fault.tool ? `:${fault.tool}` : ''}@turn ${fault.turn}`)
+            .join(', ')
+        console.log(`${YELLOW}injected (deliberate, marked in the trace): ${fired}${RESET}`)
     }
 
     const detail = result.stopDetail ? ` (${result.stopDetail})` : ''
@@ -192,6 +248,21 @@ async function main(): Promise<void> {
         process.exit(1)
     }
 
+    // Hard error rather than a silent clean run: asking for a fault and not
+    // getting one is the confusing outcome.
+    if (faultSpecs.length > 0 && !isFaultInjectionEnabled()) {
+        console.error('fault injection is off — set AGENT_FAULT_INJECTION=on in .env to use --fault')
+        process.exit(1)
+    }
+
+    let faults: Fault[] = []
+    try {
+        faults = faultSpecs.map(parseFault)
+    } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err))
+        process.exit(1)
+    }
+
     const selected = only
         ? fixtureInputs.filter(input => input.id === only)
         : fixtureInputs
@@ -228,6 +299,11 @@ async function main(): Promise<void> {
             input,
             model,
             budget,
+            logger,
+            // A fresh plan per input: faults are one-shot, and the sweep would
+            // otherwise spend them all on the first run.
+            faults: createFaultPlan(faults),
+            ...(toolTimeout ? { toolTimeoutMs: Number(toolTimeout) } : {}),
             ...(maxOutputTokens ? { maxOutputTokens: Number(maxOutputTokens) } : {}),
             ...(cancelAfter ? { signal: controller.signal } : {}),
             ...(wantsJson ? {} : { hooks: createHooks() }),

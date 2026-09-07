@@ -61,6 +61,8 @@ export type ToolErrorCode =
     | 'not_found'        // the identifier resolved to nothing that exists
     | 'invalid_argument' // arguments failed validation
     | 'internal'         // the tool itself failed
+    | 'timeout'          // the tool did not return inside its time limit
+    | 'duplicate_call'   // this exact call was already made — raised by the loop
 
 export interface ToolError {
     error: {
@@ -74,6 +76,10 @@ export type ToolResult<T> = T | ToolError
 
 export function isToolError(result: unknown): result is ToolError {
     return typeof result === 'object' && result !== null && 'error' in result
+}
+
+export function toolError(code: ToolErrorCode, message: string): ToolError {
+    return { error: { code, message } }
 }
 
 // ---- search_records ----
@@ -191,7 +197,11 @@ export interface RecordDetail {
     source_type: SourceType
     /** The user's stated reason for keeping this record; null when absent. */
     description: string | null
+    /** Cut to the tool's character limit when `truncated` is true, with a marker appended. */
     content: string
+    truncated: boolean
+    /** Length of the untruncated content, for the trace. */
+    total_chars: number
 }
 
 // ---- Registry ----
@@ -219,4 +229,16 @@ export interface ToolOutcome {
     hits?: RetrievalHit[]
 }
 
-export type ToolHandler = (args: Record<string, unknown>) => Promise<ToolOutcome>
+export interface ToolContext {
+    /**
+     * Aborted when the tool exceeds its time limit. Real implementations must
+     * pass it to their driver, or a timed-out query keeps its connection after
+     * the loop has moved on.
+     */
+    signal: AbortSignal
+}
+
+export type ToolHandler = (
+    args: Record<string, unknown>,
+    ctx: ToolContext
+) => Promise<ToolOutcome>

@@ -12,6 +12,7 @@
  *   - an unknown unit is count 0, not an error
  */
 import { readFileSync } from 'fs'
+import { toolError } from './types.js'
 import type {
     EvidenceEntry,
     GetRecordArgs,
@@ -102,6 +103,9 @@ const STRONG_RELATEDNESS_AT = 0.85
 
 const DEFAULT_WINDOW = '90d'
 
+/** Character limit on get_record's full text. Longer content is cut and marked. */
+export const MAX_RECORD_CHARS = 4000
+
 function bucket(similarity: number): Relatedness {
     return similarity >= STRONG_RELATEDNESS_AT ? 'strong' : 'weak'
 }
@@ -109,7 +113,7 @@ function bucket(similarity: number): Relatedness {
 // ---- Argument helpers ----
 
 function invalid(message: string): ToolError {
-    return { error: { code: 'invalid_argument', message } }
+    return toolError('invalid_argument', message)
 }
 
 function readString(args: Record<string, unknown>, key: string): string | null {
@@ -268,11 +272,19 @@ export const getRecord: ToolHandler = async (args): Promise<ToolOutcome> => {
 
     const record = dataset.records.find(candidate => candidate.record_id === recordId)
     if (!record) {
-        const error: ToolError = {
-            error: { code: 'not_found', message: `no record with id ${recordId}` },
-        }
-        return { result: error }
+        return { result: toolError('not_found', `no record with id ${recordId}`) }
     }
+
+    const totalChars = record.content.length
+    const truncated = totalChars > MAX_RECORD_CHARS
+
+    // The marker sits at the cut so the model meets it while reading, rather
+    // than having to notice the flag at the end of the object.
+    const content = truncated
+        ? record.content.slice(0, MAX_RECORD_CHARS) +
+          `\n\n[TRUNCATED: showing the first ${MAX_RECORD_CHARS} of ${totalChars} characters. ` +
+          'The rest of this record was not retrieved — do not assume anything about it.]'
+        : record.content
 
     const result: RecordDetail = {
         record_id: record.record_id,
@@ -280,7 +292,9 @@ export const getRecord: ToolHandler = async (args): Promise<ToolOutcome> => {
         channel: record.channel,
         source_type: record.source_type,
         description: record.description,
-        content: record.content,
+        content,
+        truncated,
+        total_chars: totalChars,
     }
     return { result }
 }

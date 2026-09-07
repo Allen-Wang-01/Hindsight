@@ -14,11 +14,20 @@
  */
 import OpenAI from 'openai'
 import { computeCost } from '../config/modelPricing.js'
+import { createLogger } from '../utils/logger.js'
+import { injectedErrorMessage } from './faults.js'
+import type { FaultPlan, FiredFault } from './faults.js'
 import { AGENT_TOOLS } from './tools/definitions.js'
 import { TOOL_HANDLERS } from './tools/stubs.js'
 import type { FixtureInput } from './tools/stubs.js'
-import { isToolError } from './tools/types.js'
-import type { RetrievalHit, ToolErrorCode, ToolName } from './tools/types.js'
+import { isToolError, toolError } from './tools/types.js'
+import type {
+    RetrievalHit,
+    ToolErrorCode,
+    ToolHandler,
+    ToolName,
+    ToolOutcome,
+} from './tools/types.js'
 import {
     AGENT_PROMPT_VERSION,
     AGENT_SYSTEM_PROMPT,
@@ -47,6 +56,22 @@ export interface AgentClient {
  */
 const AGENT_REQUEST_TIMEOUT_MS = 60_000
 
+/** Time limit on one tool execution. Exceeding it yields a `timeout` ToolError. */
+export const DEFAULT_TOOL_TIMEOUT_MS = 10_000
+
+/** Structured logging surface. Injectable so the terminal runner can silence it. */
+export interface AgentLogger {
+    info: (stage: string, fields?: Record<string, unknown>) => void
+    warn: (stage: string, fields?: Record<string, unknown>) => void
+    error: (stage: string, fields?: Record<string, unknown>) => void
+}
+
+export const SILENT_LOGGER: AgentLogger = {
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+}
+
 /** Built on first use: `new OpenAI()` throws without an API key, which would
  *  make merely importing this file fail in tests that never hit the network. */
 let defaultClient: AgentClient | undefined
@@ -63,19 +88,32 @@ export interface AgentBudget {
     maxTurns: number
     /** Ceiling on tool executions across the whole run. */
     maxToolCalls: number
+    /**
+     * Ceiling on what the run may spend before it is forced to converge. The
+     * convergence call itself is billed on top, so a run can finish slightly
+     * over. Unenforceable when the model has no pricing entry.
+     */
+    maxCostUsd: number
 }
 
 export const DEFAULT_BUDGET: AgentBudget = {
     maxTurns: 6,
     maxToolCalls: 8,
+    maxCostUsd: 0.05,
 }
 
 export type StopReason =
     | 'model_done'      // the model stopped asking for tools — the intended exit
     | 'max_turns'
     | 'max_tool_calls'
+    | 'max_cost'
     | 'incomplete'      // the provider cut the response short — see stopDetail
     | 'aborted'         // cancelled through the caller's signal
+
+/** Budget stops share one exit: force a conclusion instead of failing the run. */
+function isBudgetStop(reason: StopReason): boolean {
+    return reason === 'max_turns' || reason === 'max_tool_calls' || reason === 'max_cost'
+}
 
 export interface ToolCallRecord {
     turn: number
@@ -176,6 +214,8 @@ export interface AgentRunResult {
     totals: AgentTotals
     /** Raw similarity floats from every retrieval. Trace-only; never shown to the model. */
     retrievalHits: RetrievalHit[]
+    /** Faults that fired this run. Empty unless injection was on and requested. */
+    injectedFaults: FiredFault[]
 }
 
 /** Items the Responses API accepts back as conversation history. */
@@ -240,6 +280,60 @@ function isKnownTool(name: string): name is ToolName {
     return name in TOOL_HANDLERS
 }
 
+function describe(err: unknown): string {
+    return err instanceof Error ? err.message : String(err)
+}
+
+/**
+ * Runs one tool under a time limit, converting both failure modes into the
+ * ToolError the contract promises. The signal is what makes the limit real:
+ * the race frees the loop, cancellation frees whatever the tool was holding.
+ */
+async function callTool(
+    handler: ToolHandler,
+    args: Record<string, unknown>,
+    timeoutMs: number
+): Promise<ToolOutcome> {
+    const controller = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    // Never rejects, so a throwing tool cannot take the run down and cannot
+    // leave an unhandled rejection behind after the timeout wins the race.
+    const settled: Promise<ToolOutcome> = handler(args, { signal: controller.signal }).then(
+        outcome => outcome,
+        (err: unknown) => ({ result: toolError('internal', `tool threw: ${describe(err)}`) })
+    )
+
+    const expired = new Promise<ToolOutcome>(resolve => {
+        timer = setTimeout(() => {
+            controller.abort()
+            resolve({ result: toolError('timeout', `tool did not return within ${timeoutMs}ms`) })
+        }, timeoutMs)
+    })
+
+    try {
+        return await Promise.race([settled, expired])
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
+/** Key order is normalised so the same call written differently still matches. */
+function canonicalize(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(canonicalize)
+    if (value !== null && typeof value === 'object') {
+        const source = value as Record<string, unknown>
+        return Object.fromEntries(
+            Object.keys(source).sort().map(key => [key, canonicalize(source[key])])
+        )
+    }
+    return value
+}
+
+function callKey(name: string, args: unknown): string {
+    return `${name}:${JSON.stringify(canonicalize(args))}`
+}
+
 interface ModelCall {
     parsed: ParsedTurn
     firstTokenMs: number | null
@@ -269,17 +363,42 @@ interface ModelCall {
  * Returns null when the run was cancelled. The half-finished response is thrown
  * away rather than reported: it has no usage and no conclusion.
  */
-async function callModel(
-    client: AgentClient,
-    request: OpenAI.Responses.ResponseCreateParamsStreaming,
-    hooks: AgentHooks | undefined,
-    retryDelaysMs: number[],
+interface ModelCallParams {
+    client: AgentClient
+    request: OpenAI.Responses.ResponseCreateParamsStreaming
+    hooks: AgentHooks | undefined
+    retryDelaysMs: number[]
     signal: AbortSignal | undefined
-): Promise<ModelCall | null> {
+    /** Turn number, so an injected interruption can be aimed at one turn. */
+    turn: number
+    faults: FaultPlan | null
+    log: AgentLogger
+}
+
+/** Enough streamed text that the discarded half-sentence is visible. */
+const INJECTED_INTERRUPT_AFTER_CHARS = 40
+
+const INJECTED_INTERRUPT = 'connection reset by peer'
+
+async function callModel({
+    client,
+    request,
+    hooks,
+    retryDelaysMs,
+    signal,
+    turn,
+    faults,
+    log,
+}: ModelCallParams): Promise<ModelCall | null> {
     const startedAt = Date.now()
 
     for (let attempt = 1; ; attempt++) {
         if (signal?.aborted) return null
+
+        // Consumed per attempt: one-shot, so the retry runs clean and recovers.
+        const interrupt = faults?.takeStreamInterrupt(turn) ?? false
+        if (interrupt) log.warn('fault_injected', { kind: 'stream-interrupt', turn })
+
         let firstTokenAt: number | null = null
         let final: OpenAI.Responses.Response | undefined
         // Tracked separately from `final`: an incomplete response and a
@@ -306,6 +425,9 @@ async function callModel(
                     if (firstTokenAt === null) firstTokenAt = Date.now()
                     streamedChars += event.delta.length
                     hooks?.onTextDelta?.(event.delta)
+                    if (interrupt && streamedChars >= INJECTED_INTERRUPT_AFTER_CHARS) {
+                        throw new Error(INJECTED_INTERRUPT)
+                    }
                 } else if (event.type === 'response.completed') {
                     final = event.response
                 } else if (event.type === 'response.incomplete') {
@@ -315,6 +437,10 @@ async function callModel(
                     final = event.response
                 }
             }
+            // A turn that streamed less text than the threshold still has to
+            // die if one was injected for it.
+            if (interrupt) throw new Error(INJECTED_INTERRUPT)
+
             if (!final) {
                 failure = 'stream ended without a terminal response event'
             } else if (final.error) {
@@ -350,6 +476,7 @@ async function callModel(
         }
 
         const delayMs = jitter(retryDelaysMs[attempt - 1] ?? 0)
+        log.warn('stream_retry', { turn, attempt, delayMs, reason: failure })
         hooks?.onStreamRetry?.({
             attempt,
             reason: failure ?? 'unknown',
@@ -377,12 +504,17 @@ export interface RunAgentParams {
     client?: AgentClient
     /** Overrides DEFAULT_RETRY_DELAYS_MS. Scoped to one run; tests pass zeros. */
     retryDelaysMs?: number[]
+    /** Overrides DEFAULT_TOOL_TIMEOUT_MS. Scoped to one run. */
+    toolTimeoutMs?: number
     /**
      * Cancellation. Aborting stops the loop at the next checkpoint and returns
      * a normal result with stopReason 'aborted' — no throw, because the caller
      * still needs the bill for what was already spent.
      */
     signal?: AbortSignal
+    /** Built by createFaultPlan, which owns the gate. Null when injection is off. */
+    faults?: FaultPlan | null
+    logger?: AgentLogger
 }
 
 export async function runAgent({
@@ -393,9 +525,13 @@ export async function runAgent({
     maxOutputTokens,
     client = getDefaultClient(),
     retryDelaysMs = DEFAULT_RETRY_DELAYS_MS,
+    toolTimeoutMs = DEFAULT_TOOL_TIMEOUT_MS,
     signal,
+    faults = null,
+    logger,
 }: RunAgentParams): Promise<AgentRunResult> {
     const startedAt = Date.now()
+    const log = logger ?? createLogger('agent')
 
     const conversation: InputItem[] = [
         { role: 'developer', content: AGENT_SYSTEM_PROMPT },
@@ -404,10 +540,16 @@ export async function runAgent({
 
     const turns: TurnRecord[] = []
     const retrievalHits: RetrievalHit[] = []
+    /** Call key to the turn that first made it, for duplicate detection. */
+    const seenCalls = new Map<string, number>()
     let toolCallCount = 0
     let stopReason: StopReason = 'model_done'
     let stopDetail: string | null = null
     let turnIndex = 0
+    /** Null once any turn comes back unpriced — the ceiling is then unenforceable. */
+    let spentUsd: number | null = 0
+
+    log.info('run_started', { inputId: input.id, model, promptVersion: AGENT_PROMPT_VERSION })
 
     // Spread into every request so the ceiling applies to the convergence call
     // too — a truncated convergence is the same failure as a truncated turn.
@@ -433,13 +575,17 @@ export async function runAgent({
             stopReason = 'max_tool_calls'
             break
         }
+        if (spentUsd !== null && spentUsd >= budget.maxCostUsd) {
+            stopReason = 'max_cost'
+            break
+        }
 
         turnIndex += 1
         hooks?.onTurnStart?.(turnIndex)
 
-        const call = await callModel(
+        const call = await callModel({
             client,
-            {
+            request: {
                 model,
                 input: conversation,
                 tools: AGENT_TOOLS,
@@ -451,8 +597,11 @@ export async function runAgent({
             },
             hooks,
             retryDelaysMs,
-            signal
-        )
+            signal,
+            turn: turnIndex,
+            faults,
+            log,
+        })
 
         // Cancelled mid-stream. The turn is dropped: no usage, no conclusion.
         if (call === null) {
@@ -483,6 +632,12 @@ export async function runAgent({
             attempts,
         }
         turns.push(turn)
+        if (turn.costUsd === null) {
+            if (spentUsd !== null) log.warn('cost_ceiling_unenforceable', { model })
+            spentUsd = null
+        } else if (spentUsd !== null) {
+            spentUsd += turn.costUsd
+        }
         hooks?.onTurnEnd?.(turn)
 
         // Checked before the tool loop: a truncated turn may have been cut off
@@ -521,32 +676,72 @@ export async function runAgent({
             } catch {
                 // Left as the raw string so the trace records what was actually
                 // emitted — this is one of the failure modes phase 5 counts.
-                output = {
-                    error: { code: 'invalid_argument', message: 'arguments were not valid JSON' },
-                }
+                output = toolError('invalid_argument', 'arguments were not valid JSON')
                 errorCode = 'invalid_argument'
             }
 
-            if (output === undefined) {
-                if (!isKnownTool(call.name)) {
-                    output = {
-                        error: { code: 'not_found', message: `no tool named ${call.name}` },
-                    }
-                    errorCode = 'not_found'
-                } else {
-                    const outcome = await TOOL_HANDLERS[call.name](
-                        parsedArguments as Record<string, unknown>
+            if (output === undefined && !isKnownTool(call.name)) {
+                output = toolError('not_found', `no tool named ${call.name}`)
+                errorCode = 'not_found'
+            }
+
+            if (output === undefined && isKnownTool(call.name)) {
+                const key = callKey(call.name, parsedArguments)
+                const firstSeenTurn = seenCalls.get(key)
+
+                if (firstSeenTurn !== undefined) {
+                    // Told to the model rather than left for the call ceiling to
+                    // absorb, so it can react instead of just running out.
+                    output = toolError(
+                        'duplicate_call',
+                        `you already called ${call.name} with these arguments on turn ${firstSeenTurn}; ` +
+                        'use that result rather than repeating the call'
                     )
-                    output = outcome.result
-                    if (outcome.hits) {
-                        retrievalHits.push(...outcome.hits)
+                    errorCode = 'duplicate_call'
+                    log.warn('duplicate_tool_call', { tool: call.name, turn: turnIndex, firstSeenTurn })
+                } else {
+                    seenCalls.set(key, turnIndex)
+
+                    const fault = faults?.takeToolFault(call.name, turnIndex) ?? null
+                    if (fault) {
+                        log.warn('fault_injected', {
+                            kind: fault.kind,
+                            tool: call.name,
+                            turn: turnIndex,
+                        })
                     }
-                    if (isToolError(outcome.result)) {
-                        errorCode = outcome.result.error.code
+
+                    if (fault?.kind === 'tool-error') {
+                        const code = fault.code ?? 'internal'
+                        output = toolError(code, injectedErrorMessage(code, call.name))
+                        errorCode = code
                     } else {
-                        ok = true
+                        // An injected timeout hangs the handler and lets the real
+                        // timeout path end it, rather than faking the error.
+                        const handler: ToolHandler = fault?.kind === 'tool-timeout'
+                            ? () => new Promise<ToolOutcome>(() => {})
+                            : TOOL_HANDLERS[call.name]
+
+                        const outcome = await callTool(
+                            handler,
+                            parsedArguments as Record<string, unknown>,
+                            toolTimeoutMs
+                        )
+                        output = outcome.result
+                        if (outcome.hits) {
+                            retrievalHits.push(...outcome.hits)
+                        }
+                        if (isToolError(outcome.result)) {
+                            errorCode = outcome.result.error.code
+                        } else {
+                            ok = true
+                        }
                     }
                 }
+            }
+
+            if (errorCode) {
+                log.warn('tool_failed', { tool: call.name, turn: turnIndex, code: errorCode })
             }
 
             toolCallCount += 1
@@ -580,13 +775,14 @@ export async function runAgent({
 
     // Forced convergence. Tools are withheld rather than merely discouraged, so
     // the model cannot spend another call instead of answering.
-    if (stopReason === 'max_turns' || stopReason === 'max_tool_calls') {
+    if (isBudgetStop(stopReason)) {
+        log.info('budget_reached', { stopReason, turns: turns.length, toolCalls: toolCallCount })
         conversation.push({ role: 'user', content: CONVERGE_MESSAGE })
         hooks?.onTurnStart?.(turnIndex + 1)
 
-        const call = await callModel(
+        const call = await callModel({
             client,
-            {
+            request: {
                 model,
                 input: conversation,
                 include: ['reasoning.encrypted_content'],
@@ -596,8 +792,11 @@ export async function runAgent({
             },
             hooks,
             retryDelaysMs,
-            signal
-        )
+            signal,
+            turn: turnIndex + 1,
+            faults,
+            log,
+        })
 
         if (call === null) {
             // Cancelled while converging: the budget reason is replaced, since
@@ -651,6 +850,16 @@ export async function runAgent({
         latencyMs: Date.now() - startedAt,
     }
 
+    log.info('run_finished', {
+        inputId: input.id,
+        stopReason,
+        ...(stopDetail ? { stopDetail } : {}),
+        turns: totals.turns,
+        toolCalls: totals.toolCalls,
+        costUsd: totals.costUsd,
+        latencyMs: totals.latencyMs,
+    })
+
     return {
         inputId: input.id,
         model,
@@ -661,5 +870,6 @@ export async function runAgent({
         stopDetail,
         totals,
         retrievalHits,
+        injectedFaults: faults?.fired ?? [],
     }
 }
