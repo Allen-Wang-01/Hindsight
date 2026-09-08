@@ -387,6 +387,69 @@ describe('runAgent tool failures', () => {
     });
 });
 
+/** A call whose argument string is whatever the model emitted, valid or not. */
+function rawToolTurn(name: string, rawArguments: string, callId = 'call_1'): StreamEvent {
+    return terminal('response.completed', {
+        output: [
+            message('Looking that up.'),
+            { type: 'function_call', call_id: callId, name, arguments: rawArguments },
+        ],
+    });
+}
+
+/**
+ * What a model gets wrong on its own. Nothing is injected here — the arguments
+ * are really malformed, so they take the same path a production mistake would.
+ */
+describe('runAgent malformed tool calls', () => {
+    it('turns unparseable arguments into invalid_argument and runs no tool', async () => {
+        const handler = vi.spyOn(TOOL_HANDLERS, 'get_record');
+        const { client } = createFakeClient([
+            { events: [rawToolTurn('get_record', '{"record_id": "66a1f0c2e4b0') ] },
+            { events: [finalTurn()] },
+        ]);
+
+        const result = await runAgent({ input: INPUT, client, retryDelaysMs: NO_DELAY });
+
+        const call = result.turns[0]?.toolCalls[0];
+        expect(call?.errorCode).toBe('invalid_argument');
+        expect(handler).not.toHaveBeenCalled();
+        // The raw string is kept, not a parse-failure placeholder: phase 5
+        // counts these, and what the model actually emitted is the evidence.
+        expect(call?.arguments).toBe('{"record_id": "66a1f0c2e4b0');
+        expect(result.stopReason).toBe('model_done');
+    });
+
+    it('answers a tool that does not exist with not_found and keeps going', async () => {
+        const { client } = createFakeClient([
+            { events: [toolTurn('get_user_profile', { user_id: 'me' })] },
+            { events: [finalTurn('Concluding without it.')] },
+        ]);
+
+        const result = await runAgent({ input: INPUT, client, retryDelaysMs: NO_DELAY });
+
+        expect(result.turns[0]?.toolCalls[0]?.errorCode).toBe('not_found');
+        expect(result.stopReason).toBe('model_done');
+        expect(result.finalText).toBe('Concluding without it.');
+    });
+
+    it('runs the corrected call after the tool rejected the first one', async () => {
+        const { client } = createFakeClient([
+            // 'skill' is not a unit_type; the stub rejects it for real.
+            { events: [toolTurn('get_unit_history', { unit_type: 'skill', unit: 'system design' }, 'call_1')] },
+            { events: [toolTurn('get_unit_history', { unit_type: 'dimension', unit: 'system design' }, 'call_2')] },
+            { events: [finalTurn()] },
+        ]);
+
+        const result = await runAgent({ input: INPUT, client, retryDelaysMs: NO_DELAY });
+
+        expect(result.turns[0]?.toolCalls[0]?.errorCode).toBe('invalid_argument');
+        const corrected = result.turns[1]?.toolCalls[0];
+        expect(corrected?.ok).toBe(true);
+        expect(corrected?.resultMeta?.count).toBeGreaterThan(0);
+    });
+});
+
 describe('runAgent cost ceiling', () => {
     const USAGE = { usage: { input_tokens: 20_000, output_tokens: 5_000 } };
 
