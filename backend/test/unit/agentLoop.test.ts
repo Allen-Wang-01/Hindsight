@@ -351,6 +351,27 @@ describe('runAgent tool failures', () => {
         expect(result.totals.toolCalls).toBe(2);
     });
 
+    it('lets a failed call be retried instead of calling it a duplicate', async () => {
+        const args = { record_id: '66a1f0c2e4b09a1d3c5f7a01' };
+        const { client } = createFakeClient([
+            { events: [toolTurn('get_record', args, 'call_1')] },
+            { events: [toolTurn('get_record', args, 'call_2')] },
+            { events: [finalTurn()] },
+        ]);
+
+        vi.stubEnv('AGENT_FAULT_INJECTION', 'on');
+        const result = await runAgent({
+            input: INPUT,
+            client,
+            retryDelaysMs: NO_DELAY,
+            faults: createFaultPlan([{ kind: 'tool-error', code: 'invalid_argument' }]),
+        });
+
+        expect(result.turns[0]?.toolCalls[0]?.errorCode).toBe('invalid_argument');
+        // The retry runs the tool for real; a failed call left no result to reuse.
+        expect(result.turns[1]?.toolCalls[0]?.ok).toBe(true);
+    });
+
     it('matches duplicates regardless of argument key order', async () => {
         const handler = vi.spyOn(TOOL_HANDLERS, 'get_unit_history');
         const { client } = createFakeClient([

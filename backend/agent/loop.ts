@@ -704,8 +704,6 @@ export async function runAgent({
                     errorCode = 'duplicate_call'
                     log.warn('duplicate_tool_call', { tool: call.name, turn: turnIndex, firstSeenTurn })
                 } else {
-                    seenCalls.set(key, turnIndex)
-
                     const fault = faults?.takeToolFault(call.name, turnIndex) ?? null
                     if (fault) {
                         log.warn('fault_injected', {
@@ -742,6 +740,10 @@ export async function runAgent({
                             ok = true
                         }
                     }
+
+                    // Only successful calls are remembered. A call that failed
+                    // has no result to reuse and is the one worth retrying.
+                    if (ok) seenCalls.set(key, turnIndex)
                 }
             }
 
