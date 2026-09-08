@@ -17,20 +17,24 @@
  *   npx tsx scripts/runAgentLoop.ts --max-cost 0.001    # trip the cost ceiling
  *   npx tsx scripts/runAgentLoop.ts --log               # structured logs alongside the trajectory
  *   npx tsx scripts/runAgentLoop.ts --json              # machine-readable, no streaming
+ *   npx tsx scripts/runAgentLoop.ts --no-trace          # skip the llm_traces writes
  *
  * Fault injection (requires AGENT_FAULT_INJECTION=on in .env), repeatable:
  *   --fault tool-error:get_record:invalid_argument   # model has to correct itself
  *   --fault tool-timeout:search_records --tool-timeout 1500
  *   --fault stream-interrupt:2                       # turn 2's stream dies, then retries
  *
- * Requires OPENAI_API_KEY in .env. Writes nothing to any database — trace
- * persistence arrives in step B.
+ * Requires OPENAI_API_KEY plus the Supabase keys in .env: every run writes its
+ * trajectory to llm_traces unless --no-trace is passed. Read it back with
+ * `npx tsx scripts/checkTraces.ts --run <runId>`.
  */
 import 'dotenv/config'
 import { createFaultPlan, isFaultInjectionEnabled, parseFault } from '../agent/faults.js'
 import type { Fault } from '../agent/faults.js'
 import { DEFAULT_BUDGET, DEFAULT_MODEL, SILENT_LOGGER, runAgent } from '../agent/loop.js'
 import type { AgentHooks, AgentRunResult, TurnRecord } from '../agent/loop.js'
+import { AGENT_PROMPT_VERSION } from '../agent/prompt.js'
+import { createRunTracer } from '../agent/runTrace.js'
 import { createLogger } from '../utils/logger.js'
 import { fixtureInputs } from '../agent/tools/stubs.js'
 
@@ -59,6 +63,7 @@ function repeatedArg(name: string): string[] {
 
 const wantsJson = process.argv.includes('--json')
 const wantsLog = process.argv.includes('--log')
+const wantsTrace = !process.argv.includes('--no-trace')
 const only = arg('input')
 const model = arg('model') ?? DEFAULT_MODEL
 const maxTurns = arg('max-turns')
@@ -295,24 +300,54 @@ async function main(): Promise<void> {
             }, Number(cancelAfter))
             : undefined
 
-        const result = await runAgent({
-            input,
-            model,
-            budget,
-            logger,
-            // A fresh plan per input: faults are one-shot, and the sweep would
-            // otherwise spend them all on the first run.
-            faults: createFaultPlan(faults),
-            ...(toolTimeout ? { toolTimeoutMs: Number(toolTimeout) } : {}),
-            ...(maxOutputTokens ? { maxOutputTokens: Number(maxOutputTokens) } : {}),
-            ...(cancelAfter ? { signal: controller.signal } : {}),
-            ...(wantsJson ? {} : { hooks: createHooks() }),
-        })
+        // A fresh plan per input: faults are one-shot, and the sweep would
+        // otherwise spend them all on the first run.
+        const plan = createFaultPlan(faults)
+        const displayHooks = wantsJson ? undefined : createHooks()
+
+        const tracer = wantsTrace
+            ? createRunTracer({
+                model,
+                promptVersion: AGENT_PROMPT_VERSION,
+                input,
+                faults: plan,
+                origin: 'runner',
+                ...(displayHooks ? { hooks: displayHooks } : {}),
+            })
+            : null
+
+        const hooks = tracer ? tracer.hooks : displayHooks
+
+        let result: AgentRunResult
+        try {
+            result = await runAgent({
+                input,
+                model,
+                budget,
+                logger,
+                faults: plan,
+                ...(toolTimeout ? { toolTimeoutMs: Number(toolTimeout) } : {}),
+                ...(maxOutputTokens ? { maxOutputTokens: Number(maxOutputTokens) } : {}),
+                ...(cancelAfter ? { signal: controller.signal } : {}),
+                ...(hooks ? { hooks } : {}),
+            })
+        } catch (err) {
+            if (cancelTimer) clearTimeout(cancelTimer)
+            await tracer?.fail(err)
+            throw err
+        }
         if (cancelTimer) clearTimeout(cancelTimer)
+        await tracer?.finish(result)
         results.push(result)
 
         if (!wantsJson) {
             printRunFooter(result)
+            if (tracer) {
+                console.log(
+                    `${DIM}trace: run ${tracer.runId} · ` +
+                    `npx tsx scripts/checkTraces.ts --run ${tracer.runId}${RESET}`
+                )
+            }
         }
     }
 
