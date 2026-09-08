@@ -222,11 +222,23 @@ export type ToolName = (typeof TOOL_NAMES)[number]
  * `hits` is the out-of-band channel for data the trace wants but the model
  * must not see.
  */
+/** Trace-only summary of a tool's result. Each field applies only where relevant. */
+export interface ToolResultMeta {
+    /** Rows returned. 0 is an empty result, not a failure. */
+    count?: number
+    /** The output was cut to fit a limit. */
+    truncated?: boolean
+    /** Length of the output before truncation. */
+    totalChars?: number
+}
+
 export interface ToolOutcome {
     /** Serialised back to the model as the function call output. */
     result: unknown
     /** Trace-only payload. Never reaches the model. */
     hits?: RetrievalHit[]
+    /** Trace-only result summary. Never reaches the model. */
+    meta?: ToolResultMeta
 }
 
 export interface ToolContext {

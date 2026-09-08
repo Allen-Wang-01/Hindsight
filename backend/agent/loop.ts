@@ -27,6 +27,7 @@ import type {
     ToolHandler,
     ToolName,
     ToolOutcome,
+    ToolResultMeta,
 } from './tools/types.js'
 import {
     AGENT_PROMPT_VERSION,
@@ -124,6 +125,8 @@ export interface ToolCallRecord {
     ok: boolean
     errorCode?: ToolErrorCode
     durationMs: number
+    /** What the tool returned, summarised. Absent on failed and skipped calls. */
+    resultMeta?: ToolResultMeta
 }
 
 export interface TurnRecord {
@@ -670,6 +673,7 @@ export async function runAgent({
             let output: unknown
             let ok = false
             let errorCode: ToolErrorCode | undefined
+            let resultMeta: ToolResultMeta | undefined
 
             try {
                 parsedArguments = JSON.parse(call.rawArguments) as unknown
@@ -728,6 +732,7 @@ export async function runAgent({
                             toolTimeoutMs
                         )
                         output = outcome.result
+                        resultMeta = outcome.meta
                         if (outcome.hits) {
                             retrievalHits.push(...outcome.hits)
                         }
@@ -752,6 +757,7 @@ export async function runAgent({
                 ok,
                 ...(errorCode ? { errorCode } : {}),
                 durationMs: Date.now() - callStartedAt,
+                ...(resultMeta ? { resultMeta } : {}),
             }
             turn.toolCalls.push(record)
             hooks?.onToolEnd?.(record)
