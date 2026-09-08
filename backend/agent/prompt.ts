@@ -5,6 +5,7 @@
  * and of the report prompt, because they evolve on separate schedules and the
  * trace has to be able to tell which one produced a row.
  */
+import { hashInput } from '../lib/hash.js'
 import type { FixtureInput } from './tools/stubs.js'
 
 export const AGENT_PROMPT_VERSION = 'agent-v2'
@@ -64,6 +65,12 @@ If you retrieve records and judge them irrelevant, say which ones and why you se
 HOW TO FINISH
 
 Close with your reading of the evidence in at most 120 words of plain prose: what it shows, whether it repeats something already on record or is new, and the record ids behind each part. Then stop — nothing follows the conclusion.`
+
+/**
+ * Fingerprint of the system prompt above, recorded on every agent trace row.
+ * Catches an edit that did not bump AGENT_PROMPT_VERSION.
+ */
+export const AGENT_PROMPT_HASH = hashInput(AGENT_SYSTEM_PROMPT)
 
 /** The evidence entry under review, rendered as the opening user message. */
 export function buildEvidenceMessage(input: FixtureInput): string {

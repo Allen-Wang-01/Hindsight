@@ -13,6 +13,7 @@
  * stubs validate their own arguments instead.
  */
 import type OpenAI from 'openai'
+import { hashInput } from '../../lib/hash.js'
 
 export const AGENT_TOOLS: OpenAI.Responses.Tool[] = [
     {
@@ -126,3 +127,6 @@ export const AGENT_TOOLS: OpenAI.Responses.Tool[] = [
         },
     },
 ]
+
+/** Fingerprint of the definitions above, recorded on every agent trace row. */
+export const AGENT_TOOLS_HASH = hashInput(JSON.stringify(AGENT_TOOLS))
