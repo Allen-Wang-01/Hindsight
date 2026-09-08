@@ -20,9 +20,13 @@
  *   npx tsx scripts/runAgentLoop.ts --no-trace          # skip the llm_traces writes
  *
  * Fault injection (requires AGENT_FAULT_INJECTION=on in .env), repeatable:
- *   --fault tool-error:get_record:invalid_argument   # model has to correct itself
+ *   --fault tool-error:get_record                    # tool fails once, then recovers
  *   --fault tool-timeout:search_records --tool-timeout 1500
  *   --fault stream-interrupt:2                       # turn 2's stream dies, then retries
+ *
+ * An error code can be appended (`:invalid_argument`), but that is for tests
+ * only: the arguments really were valid, so the retry succeeds unchanged and
+ * the trajectory is identical to the default `internal`.
  *
  * Requires OPENAI_API_KEY plus the Supabase keys in .env: every run writes its
  * trajectory to llm_traces unless --no-trace is passed. Read it back with
