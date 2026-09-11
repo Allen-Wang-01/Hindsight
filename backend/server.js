@@ -12,6 +12,8 @@ import { checkConnection } from './config/postgres.js'
 import mcpRouter from './routes/mcp.js'
 import oauthDiscoveryRouter from './routes/oauthDiscovery.js'
 import savedMemoriesRouter from './routes/savedMemories.js'
+import agentRouter from './routes/agent.js'
+import { installShutdownHandlers } from './lib/shutdown.js'
 dotenv.config();
 
 const app = express();
@@ -39,6 +41,7 @@ app.use('/api/notes', noteRouter)
 app.use('/api/reports', apiRateLimiter, reportRoutes)
 app.use('/api/mcp', mcpRouter)
 app.use('/api/saved-memories', savedMemoriesRouter)
+app.use('/api/agent', agentRouter)
 
 app.use((err, req, res, next) => {
     res.status(500).json({ message: "Internal Server Error" });
@@ -51,7 +54,7 @@ app.get('/', (req, res) => {
 
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, async () => {
+const server = app.listen(PORT, async () => {
     console.log(`Server running on port ${PORT}`);
     await checkConnection() // check postgreSQL connection
     // if (process.env.NODE_ENV === 'production') {
@@ -60,4 +63,6 @@ app.listen(PORT, async () => {
     //     console.log('[Server] Cron jobs loaded: weekly (Sun 00:00), monthly (1st 00:05) JST');
     // }
 });
+
+installShutdownHandlers(server);
 
