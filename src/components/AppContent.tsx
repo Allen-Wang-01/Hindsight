@@ -15,6 +15,7 @@ import MemoryPage from './MemoryPage';
 import ProtectedRoute from './ProtectedRoute';
 import styles from '../styles/Main.module.scss'
 import LandingPage from '../pages/Landing/LandingPage'
+import AgentDemoPage from '../pages/AgentDemo/AgentDemoPage'
 
 
 
@@ -134,6 +135,14 @@ const AppContent = () => {
                         element={
                             <ProtectedRoute>
                                 <MemoryPage />
+                            </ProtectedRoute>
+                        }
+                    />
+                    <Route
+                        path="/agent"
+                        element={
+                            <ProtectedRoute>
+                                <AgentDemoPage />
                             </ProtectedRoute>
                         }
                     />
