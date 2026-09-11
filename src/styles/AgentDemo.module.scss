@@ -235,3 +235,17 @@
     font-size: 13px;
     color: t.$color-danger;
 }
+
+.alarm {
+    @extend .error;
+    padding: 8px 11px;
+    background: rgba(184, 85, 58, 0.09);
+    border-radius: t.$radius-sm;
+    line-height: 1.5;
+}
+
+.warn {
+    @extend .alarm;
+    color: t.$color-accent-deep;
+    background: t.$color-accent-soft;
+}

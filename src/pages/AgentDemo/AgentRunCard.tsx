@@ -1,16 +1,21 @@
 import { useAgentStream } from '../../hooks/useAgentStream'
-import type { TrajectoryToolCall, TrajectoryTurn } from '../../hooks/useAgentStream'
+import type { RunOutcome, TrajectoryToolCall, TrajectoryTurn } from '../../hooks/useAgentStream'
 import styles from '../../styles/AgentDemo.module.scss'
 
 export interface AgentInput {
     id: string
     note: string
+    /** Whether this card offers the harness scenarios beyond a plain run. */
+    scenarios: boolean
 }
 
 interface AgentRunCardProps {
     input: AgentInput
     faultInjectionEnabled: boolean
 }
+
+/** Low enough that a turn is cut off mid-sentence. */
+const TRUNCATING_OUTPUT_TOKENS = 200
 
 function money(value: number | null | undefined): string {
     if (value === null || value === undefined) return 'unpriced'
@@ -49,34 +54,51 @@ const AgentRunCard = ({ input, faultInjectionEnabled }: AgentRunCardProps) => {
                     Run
                 </button>
 
-                <button
-                    className={styles.action}
-                    onClick={() => start({ inputId: input.id, maxTurns: 1 })}
-                    disabled={isRunning}
-                >
-                    Squeeze the budget to one turn
-                </button>
-
-                {faultInjectionEnabled && (
+                {input.scenarios && (
                     <>
                         <button
                             className={styles.action}
-                            onClick={() =>
-                                start({ inputId: input.id, faults: ['tool-error:get_record'] })
-                            }
+                            onClick={() => start({ inputId: input.id, maxTurns: 1 })}
                             disabled={isRunning}
                         >
-                            Inject one tool failure
+                            Squeeze the budget to one turn
                         </button>
+
                         <button
                             className={styles.action}
                             onClick={() =>
-                                start({ inputId: input.id, faults: ['stream-interrupt:2'] })
+                                start({
+                                    inputId: input.id,
+                                    maxOutputTokens: TRUNCATING_OUTPUT_TOKENS,
+                                })
                             }
                             disabled={isRunning}
                         >
-                            Break the stream on turn 2
+                            Cut the output short
                         </button>
+
+                        {faultInjectionEnabled && (
+                            <>
+                                <button
+                                    className={styles.action}
+                                    onClick={() =>
+                                        start({ inputId: input.id, faults: ['tool-error'] })
+                                    }
+                                    disabled={isRunning}
+                                >
+                                    Inject one tool failure
+                                </button>
+                                <button
+                                    className={styles.action}
+                                    onClick={() =>
+                                        start({ inputId: input.id, faults: ['stream-interrupt:2'] })
+                                    }
+                                    disabled={isRunning}
+                                >
+                                    Break the stream on turn 2
+                                </button>
+                            </>
+                        )}
                     </>
                 )}
 
@@ -100,6 +122,8 @@ const AgentRunCard = ({ input, faultInjectionEnabled }: AgentRunCardProps) => {
                     {activeTool ? `running ${activeTool}…` : 'thinking…'}
                 </p>
             )}
+
+            {outcome && <StopNotice outcome={outcome} />}
 
             {outcome && (
                 <footer className={styles.outcome}>
@@ -127,6 +151,43 @@ const AgentRunCard = ({ input, faultInjectionEnabled }: AgentRunCardProps) => {
     )
 }
 
+const BUDGET_STOPS = ['max_turns', 'max_tool_calls', 'max_cost']
+
+/**
+ * Says what a non-ordinary ending means. A truncated run in particular reads
+ * as a terse conclusion unless it is called out.
+ */
+const StopNotice = ({ outcome }: { outcome: RunOutcome }) => {
+    if (outcome.stopReason === 'incomplete') {
+        return (
+            <p className={styles.alarm}>
+                Output truncated ({outcome.stopDetail}) — the text above stops where the limit
+                hit. It is not a conclusion.
+            </p>
+        )
+    }
+
+    if (outcome.stopReason === 'aborted') {
+        return (
+            <p className={styles.alarm}>
+                Cancelled — the loop stopped at its next checkpoint. The cost below is everything
+                this run spent.
+            </p>
+        )
+    }
+
+    if (BUDGET_STOPS.includes(outcome.stopReason)) {
+        return (
+            <p className={styles.warn}>
+                Budget reached ({outcome.stopReason}) — the conclusion above came from forced
+                convergence, with the tools withheld.
+            </p>
+        )
+    }
+
+    return null
+}
+
 const Turn = ({ turn }: { turn: TrajectoryTurn }) => {
     const isDead = turn.status === 'error'
 
@@ -136,8 +197,11 @@ const Turn = ({ turn }: { turn: TrajectoryTurn }) => {
                 <span className={styles.turnNumber}>turn {turn.turn}</span>
                 {turn.metrics && (
                     <span className={styles.turnMeta}>
-                        {seconds(turn.metrics.latencyMs)} · in {turn.metrics.inputTokens} / out{' '}
-                        {turn.metrics.outputTokens} · {money(turn.metrics.costUsd)}
+                        {seconds(turn.metrics.latencyMs)} · in {turn.metrics.inputTokens}
+                        {turn.metrics.cachedTokens > 0
+                            ? ` (${turn.metrics.cachedTokens} cached)`
+                            : ''}{' '}
+                        / out {turn.metrics.outputTokens} · {money(turn.metrics.costUsd)}
                     </span>
                 )}
             </div>
@@ -161,7 +225,8 @@ const Turn = ({ turn }: { turn: TrajectoryTurn }) => {
                             <span className={styles.toolName}>{call.name}</span>
                             <span className={styles.toolArgs}>{toolArguments(call)}</span>
                             <span className={styles.toolMeta}>
-                                {call.ok ? `${call.durationMs}ms` : call.errorCode}
+                                {call.ok ? '' : `${call.errorCode} · `}
+                                {call.durationMs}ms
                                 {call.resultMeta?.count !== undefined
                                     ? ` · ${call.resultMeta.count} results`
                                     : ''}

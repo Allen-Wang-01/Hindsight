@@ -101,6 +101,7 @@ export interface StartRunOptions {
     maxTurns?: number
     maxToolCalls?: number
     maxCostUsd?: number
+    maxOutputTokens?: number
 }
 
 /** Folds one event into the trajectory. */
