@@ -6,6 +6,11 @@
 app = 'smart-notes-api'
 primary_region = 'nrt'
 
+# Grace period between SIGTERM and SIGKILL. Long enough for an in-flight note
+# job to finish; the process exits as soon as it is done, so an idle machine
+# still stops immediately.
+kill_timeout = "30s"
+
 [build]
 
 [http_service]

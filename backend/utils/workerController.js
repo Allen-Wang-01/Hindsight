@@ -91,9 +91,17 @@ export function createWorkerController({
         }
     }
 
-    async function shutdown() {
+    /**
+     * Closes the worker.
+     *
+     * `ifIdle` (the default) does nothing while jobs are active — the idle
+     * watcher calls it that way and looks again on its next tick. Pass false to
+     * close regardless: BullMQ stops taking new jobs and waits for the active
+     * ones, which is what a process shutting down needs.
+     */
+    async function shutdown({ ifIdle = true } = {}) {
         if (!worker) return
-        if (activeJobCount > 0) {
+        if (ifIdle && activeJobCount > 0) {
             log(`Shutdown skipped: ${activeJobCount} job(s) still active`)
             return
         }
@@ -105,6 +113,7 @@ export function createWorkerController({
         } finally {
             worker = null
             lastActiveAt = 0
+            if (idleTimer) clearInterval(idleTimer)
             idleTimer = null
             log("worker closed")
         }
