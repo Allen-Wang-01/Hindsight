@@ -288,6 +288,14 @@ function describe(err: unknown): string {
 }
 
 /**
+ * The reason the caller passed to abort(), reported as stopDetail. Aborting
+ * without one yields a DOMException, which carries nothing worth keeping.
+ */
+function abortReason(signal: AbortSignal | undefined): string | null {
+    return typeof signal?.reason === 'string' ? signal.reason : null
+}
+
+/**
  * Runs one tool under a time limit, converting both failure modes into the
  * ToolError the contract promises. The signal is what makes the limit real:
  * the race frees the loop, cancellation frees whatever the tool was holding.
@@ -841,6 +849,10 @@ export async function runAgent({
             turns.push(turn)
             hooks?.onTurnEnd?.(turn)
         }
+    }
+
+    if (stopReason === 'aborted' && stopDetail === null) {
+        stopDetail = abortReason(signal)
     }
 
     const pricedTurns = turns.filter(t => t.costUsd !== null)

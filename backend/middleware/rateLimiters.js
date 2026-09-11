@@ -20,6 +20,28 @@ export const sseRateLimiter = rateLimit({
     legacyHeaders: false,
 });
 
+/**
+ * Rate limiter for starting agent runs. Each run is several model calls, so
+ * this is far tighter than the ordinary API limit.
+ */
+export const agentRunRateLimiter = rateLimit({
+    windowMs: 5 * 60 * 1000, // 5 minutes
+    max: 20,                 // 20 runs per IP per 5 minutes
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+/**
+ * Rate limiter for watching an agent run. Looser than starting one: attaching
+ * costs nothing, and a page refresh must not lock the viewer out.
+ */
+export const agentStreamRateLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
 export const authRateLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 20,                 // 20 attempts per IP
