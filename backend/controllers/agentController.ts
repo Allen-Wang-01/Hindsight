@@ -30,6 +30,13 @@ const RUN_ORIGIN = 'demo'
 
 const MAX_FAULTS_PER_RUN = 3
 
+/**
+ * Ceiling on the per-call output limit a request may set. Lowering it is how a
+ * truncated response is produced on demand; it can only reduce what a turn
+ * costs, so the cap just keeps the value bounded.
+ */
+const MAX_OUTPUT_TOKENS_CEILING = 4000
+
 function userIdOf(req: Request): string | null {
     const { user } = req as Request & { user?: { userId?: unknown } }
     return typeof user?.userId === 'string' ? user.userId : null
@@ -61,6 +68,19 @@ function resolveBudget(body: Record<string, unknown>): AgentBudget | string {
     }
 
     return budget
+}
+
+/**
+ * Reads the optional per-call output limit. Returns undefined when the request
+ * did not set one, or an error message when it is malformed.
+ */
+function resolveMaxOutputTokens(body: Record<string, unknown>): number | undefined | string {
+    const raw = body['maxOutputTokens']
+    if (raw === undefined || raw === null) return undefined
+    if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0) {
+        return 'maxOutputTokens must be a positive integer'
+    }
+    return Math.min(raw, MAX_OUTPUT_TOKENS_CEILING)
 }
 
 /**
@@ -98,7 +118,11 @@ function resolveFaults(body: Record<string, unknown>): FaultPlan | null | string
  */
 export const listAgentInputs = async (_req: Request, res: Response): Promise<void> => {
     res.json({
-        inputs: fixtureInputs.map(input => ({ id: input.id, note: input.note })),
+        inputs: fixtureInputs.map(input => ({
+            id: input.id,
+            note: input.note,
+            scenarios: input.scenarios === true,
+        })),
         faultInjectionEnabled: isFaultInjectionEnabled(),
         model: DEFAULT_MODEL,
         budget: DEFAULT_BUDGET,
@@ -143,13 +167,20 @@ export const createAgentRun = async (req: Request, res: Response): Promise<void>
         return
     }
 
+    const maxOutputTokens = resolveMaxOutputTokens(body)
+    if (typeof maxOutputTokens === 'string') {
+        res.status(400).json({ error: maxOutputTokens })
+        return
+    }
+
     const runId = randomUUID()
 
     try {
         startRun({
             runId,
             userId,
-            run: ctx => executeRun({ runId, userId, input, budget, faults, ctx }),
+            run: ctx =>
+                executeRun({ runId, userId, input, budget, faults, maxOutputTokens, ctx }),
         })
     } catch (err) {
         if (err instanceof RunLimitError) {
@@ -171,6 +202,7 @@ interface ExecuteRunParams {
     input: FixtureInput
     budget: AgentBudget
     faults: FaultPlan | null
+    maxOutputTokens: number | undefined
     ctx: RunContext
 }
 
@@ -185,6 +217,7 @@ async function executeRun({
     input,
     budget,
     faults,
+    maxOutputTokens,
     ctx,
 }: ExecuteRunParams): Promise<void> {
     const tracer = createRunTracer({
@@ -208,6 +241,7 @@ async function executeRun({
             faults,
             signal: ctx.signal,
             hooks: tracer.hooks,
+            ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
         })
         ctx.emit(doneEvent(result))
         await tracer.finish(result)

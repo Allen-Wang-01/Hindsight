@@ -62,6 +62,8 @@ interface FixtureSubject {
 export interface FixtureInput {
     id: string
     note: string
+    /** True on the input the harness scenarios (budget, faults, truncation) run against. */
+    scenarios?: boolean
     evidence: {
         unit_type: UnitType
         unit: string

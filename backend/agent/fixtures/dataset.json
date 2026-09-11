@@ -151,6 +151,7 @@
     {
       "id": "deep",
       "note": "Expect: get_unit_history surfaces the 2026-07-03 rate limiting entry, then get_record to read what was actually said. Same gap recurring, not a new one.",
+      "scenarios": true,
       "evidence": {
         "unit_type": "dimension",
         "unit": "system design",
