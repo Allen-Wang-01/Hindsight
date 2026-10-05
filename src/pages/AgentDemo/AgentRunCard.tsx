@@ -1,5 +1,11 @@
+import { useState } from 'react'
 import { useAgentStream } from '../../hooks/useAgentStream'
-import type { RunOutcome, TrajectoryToolCall, TrajectoryTurn } from '../../hooks/useAgentStream'
+import type {
+    RunOutcome,
+    StartRunOptions,
+    TrajectoryToolCall,
+    TrajectoryTurn,
+} from '../../hooks/useAgentStream'
 import styles from '../../styles/AgentDemo.module.scss'
 
 export interface AgentInput {
@@ -12,10 +18,15 @@ export interface AgentInput {
 interface AgentRunCardProps {
     input: AgentInput
     faultInjectionEnabled: boolean
+    /** The server's default ceilings, used as the context bar's scale. */
+    defaultMaxInputTokens: number
 }
 
 /** Low enough that a turn is cut off mid-sentence. */
 const TRUNCATING_OUTPUT_TOKENS = 200
+
+/** Small enough that the conversation outgrows it after a few turns. */
+const SQUEEZED_INPUT_TOKENS = 2500
 
 function money(value: number | null | undefined): string {
     if (value === null || value === undefined) return 'unpriced'
@@ -34,9 +45,20 @@ function toolArguments(call: TrajectoryToolCall): string {
     }
 }
 
-const AgentRunCard = ({ input, faultInjectionEnabled }: AgentRunCardProps) => {
+const AgentRunCard = ({
+    input,
+    faultInjectionEnabled,
+    defaultMaxInputTokens,
+}: AgentRunCardProps) => {
     const { status, turns, outcome, activeTool, error, start, cancel } = useAgentStream()
+    const [ceiling, setCeiling] = useState(defaultMaxInputTokens)
     const isRunning = status === 'starting' || status === 'running'
+
+    /** Starts a run and remembers the context ceiling it will be held to. */
+    const run = (options: Omit<StartRunOptions, 'inputId'> = {}) => {
+        setCeiling(options.maxInputTokens ?? defaultMaxInputTokens)
+        start({ inputId: input.id, ...options })
+    }
 
     return (
         <section className={styles.card}>
@@ -48,7 +70,7 @@ const AgentRunCard = ({ input, faultInjectionEnabled }: AgentRunCardProps) => {
             <div className={styles.actions}>
                 <button
                     className={styles.primaryAction}
-                    onClick={() => start({ inputId: input.id })}
+                    onClick={() => run()}
                     disabled={isRunning}
                 >
                     Run
@@ -58,7 +80,7 @@ const AgentRunCard = ({ input, faultInjectionEnabled }: AgentRunCardProps) => {
                     <>
                         <button
                             className={styles.action}
-                            onClick={() => start({ inputId: input.id, maxTurns: 1 })}
+                            onClick={() => run({ maxTurns: 1 })}
                             disabled={isRunning}
                         >
                             Squeeze the budget to one turn
@@ -66,12 +88,15 @@ const AgentRunCard = ({ input, faultInjectionEnabled }: AgentRunCardProps) => {
 
                         <button
                             className={styles.action}
-                            onClick={() =>
-                                start({
-                                    inputId: input.id,
-                                    maxOutputTokens: TRUNCATING_OUTPUT_TOKENS,
-                                })
-                            }
+                            onClick={() => run({ maxInputTokens: SQUEEZED_INPUT_TOKENS })}
+                            disabled={isRunning}
+                        >
+                            Shrink the context window
+                        </button>
+
+                        <button
+                            className={styles.action}
+                            onClick={() => run({ maxOutputTokens: TRUNCATING_OUTPUT_TOKENS })}
                             disabled={isRunning}
                         >
                             Cut the output short
@@ -81,18 +106,14 @@ const AgentRunCard = ({ input, faultInjectionEnabled }: AgentRunCardProps) => {
                             <>
                                 <button
                                     className={styles.action}
-                                    onClick={() =>
-                                        start({ inputId: input.id, faults: ['tool-error'] })
-                                    }
+                                    onClick={() => run({ faults: ['tool-error'] })}
                                     disabled={isRunning}
                                 >
                                     Inject one tool failure
                                 </button>
                                 <button
                                     className={styles.action}
-                                    onClick={() =>
-                                        start({ inputId: input.id, faults: ['stream-interrupt:2'] })
-                                    }
+                                    onClick={() => run({ faults: ['stream-interrupt:2'] })}
                                     disabled={isRunning}
                                 >
                                     Break the stream on turn 2
@@ -108,6 +129,8 @@ const AgentRunCard = ({ input, faultInjectionEnabled }: AgentRunCardProps) => {
             </div>
 
             {error && <p className={styles.error}>{error}</p>}
+
+            {turns.length > 0 && <ContextBar turns={turns} ceiling={ceiling} />}
 
             {turns.length > 0 && (
                 <ol className={styles.trajectory}>
@@ -151,7 +174,33 @@ const AgentRunCard = ({ input, faultInjectionEnabled }: AgentRunCardProps) => {
     )
 }
 
-const BUDGET_STOPS = ['max_turns', 'max_tool_calls', 'max_cost']
+/**
+ * How full the conversation is, against the ceiling this run was given. The
+ * bar falls when the loop compacts, which is the only place compaction shows.
+ */
+const ContextBar = ({ turns, ceiling }: { turns: TrajectoryTurn[]; ceiling: number }) => {
+    const measured = turns.filter(turn => turn.metrics)
+    const latest = measured[measured.length - 1]?.metrics
+    if (!latest) return null
+
+    const previous = measured[measured.length - 2]?.metrics
+    const compacted = previous ? latest.inputTokens < previous.inputTokens : false
+    const percent = Math.min(100, Math.round((latest.inputTokens / ceiling) * 100))
+
+    return (
+        <div className={styles.context}>
+            <div className={styles.contextTrack}>
+                <div className={styles.contextFill} style={{ width: `${percent}%` }} />
+            </div>
+            <span className={styles.contextLabel}>
+                context {latest.inputTokens.toLocaleString()} / {ceiling.toLocaleString()} tokens
+                {compacted ? ' · compacted to fit' : ''}
+            </span>
+        </div>
+    )
+}
+
+const BUDGET_STOPS = ['max_turns', 'max_tool_calls', 'max_cost', 'max_input_tokens']
 
 /**
  * Says what a non-ordinary ending means. A truncated run in particular reads

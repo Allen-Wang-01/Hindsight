@@ -119,6 +119,32 @@
     color: t.$color-danger;
 }
 
+// ---- Context bar -----------------------------------------------------------
+.context {
+    margin-top: 16px;
+}
+
+.contextTrack {
+    height: 6px;
+    overflow: hidden;
+    background: t.$color-surface-sunk;
+    border-radius: 999px;
+}
+
+.contextFill {
+    height: 100%;
+    background: t.$color-accent;
+    border-radius: 999px;
+    transition: width 320ms t.$ease-soft;
+}
+
+.contextLabel {
+    display: block;
+    margin-top: 5px;
+    font-size: 12px;
+    color: t.$color-ink-mute;
+}
+
 // ---- Trajectory ------------------------------------------------------------
 .trajectory {
     list-style: none;

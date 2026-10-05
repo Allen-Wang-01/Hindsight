@@ -8,7 +8,12 @@ interface AgentConfig {
     inputs: AgentInput[]
     faultInjectionEnabled: boolean
     model: string
-    budget: { maxTurns: number; maxToolCalls: number; maxCostUsd: number }
+    budget: {
+        maxTurns: number
+        maxToolCalls: number
+        maxCostUsd: number
+        maxInputTokens: number
+    }
 }
 
 const AgentDemoPage = () => {
@@ -56,6 +61,7 @@ const AgentDemoPage = () => {
                         key={input.id}
                         input={input}
                         faultInjectionEnabled={config.faultInjectionEnabled}
+                        defaultMaxInputTokens={config.budget.maxInputTokens}
                     />
                 ))}
             </div>
