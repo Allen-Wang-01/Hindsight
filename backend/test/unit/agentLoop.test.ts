@@ -8,8 +8,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import type OpenAI from 'openai';
 import { createFaultPlan } from '../../agent/faults.js';
+import { createEstimator } from '../../agent/context.js';
 import { DEFAULT_BUDGET, runAgent } from '../../agent/loop.js';
-import type { AgentClient, StreamRetry } from '../../agent/loop.js';
+import type { AgentClient, AgentLogger, StreamRetry } from '../../agent/loop.js';
+import { AGENT_SYSTEM_PROMPT, buildEvidenceMessage } from '../../agent/prompt.js';
 import { TOOL_HANDLERS } from '../../agent/tools/stubs.js';
 import type { FixtureInput } from '../../agent/tools/stubs.js';
 import type { ToolContext } from '../../agent/tools/types.js';
@@ -495,6 +497,106 @@ describe('runAgent cost ceiling', () => {
         const result = await runAgent({ input: INPUT, client, retryDelaysMs: NO_DELAY });
 
         expect(result.stopReason).toBe('model_done');
+    });
+});
+
+describe('runAgent context ceiling', () => {
+    /** A turn that reads a record, so there is a bulky result to compact away. */
+    function recordTurn(recordId: string, callId: string): Attempt {
+        return {
+            events: [
+                terminal('response.completed', {
+                    output: [
+                        message('Opening that record.'),
+                        functionCall('get_record', { record_id: recordId }, callId),
+                    ],
+                }),
+            ],
+        };
+    }
+
+    /** Collects the stages the loop logged, so compaction can be asserted directly. */
+    function createRecordingLogger(): { logger: AgentLogger; stages: string[] } {
+        const stages: string[] = [];
+        const record = (stage: string) => stages.push(stage);
+        return { logger: { info: record, warn: record, error: record }, stages };
+    }
+
+    /**
+     * The size of what the loop never compacts. Derived rather than hardcoded:
+     * editing the system prompt must not break this test for unrelated reasons.
+     */
+    function preambleTokens(): number {
+        return createEstimator().estimate([
+            { role: 'developer', content: AGENT_SYSTEM_PROMPT },
+            { role: 'user', content: buildEvidenceMessage(INPUT) },
+        ]);
+    }
+
+    /** What one record's result costs, measured from the tool itself. */
+    async function recordTokens(recordId: string): Promise<number> {
+        const outcome = await TOOL_HANDLERS.get_record(
+            { record_id: recordId },
+            { signal: new AbortController().signal }
+        );
+        return createEstimator().estimate([
+            {
+                type: 'function_call_output',
+                call_id: 'call_1',
+                output: JSON.stringify(outcome.result),
+            },
+        ]);
+    }
+
+    /** Covers the narration and the function call that accompany a result. */
+    const TURN_OVERHEAD_TOKENS = 200;
+
+    it('compacts instead of stopping, and the run carries on', async () => {
+        const { client, calls } = createFakeClient([
+            recordTurn('66a1f0c2e4b09a1d3c5f7a01', 'call_1'),
+            recordTurn('66a1f0c2e4b09a1d3c5f7a02', 'call_2'),
+            { events: [finalTurn('Both records say the same thing.')] },
+        ]);
+        const { logger, stages } = createRecordingLogger();
+
+        // Room for the preamble and exactly one record, so the second one does
+        // not fit and the older one has to give way.
+        const maxInputTokens =
+            preambleTokens()
+            + (await recordTokens('66a1f0c2e4b09a1d3c5f7a01'))
+            + TURN_OVERHEAD_TOKENS;
+
+        const result = await runAgent({
+            input: INPUT,
+            client,
+            retryDelaysMs: NO_DELAY,
+            logger,
+            budget: { ...DEFAULT_BUDGET, maxInputTokens },
+        });
+
+        expect(stages).toContain('context_compacted');
+        expect(result.stopReason).toBe('model_done');
+        expect(calls()).toBe(3);
+        expect(result.finalText).toBe('Both records say the same thing.');
+    });
+
+    it('forces convergence when even a compacted conversation will not fit', async () => {
+        const { client, calls } = createFakeClient([
+            { events: [finalTurn('Concluding from what I have.')] },
+        ]);
+
+        // Smaller than the preamble, so there is nothing compaction can give up.
+        const result = await runAgent({
+            input: INPUT,
+            client,
+            retryDelaysMs: NO_DELAY,
+            budget: { ...DEFAULT_BUDGET, maxInputTokens: 10 },
+        });
+
+        expect(result.stopReason).toBe('max_input_tokens');
+        // The run still had to produce something: the convergence call.
+        expect(calls()).toBe(1);
+        expect(result.finalText).toBe('Concluding from what I have.');
     });
 });
 

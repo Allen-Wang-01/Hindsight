@@ -239,6 +239,12 @@ export interface ToolOutcome {
     hits?: RetrievalHit[]
     /** Trace-only result summary. Never reaches the model. */
     meta?: ToolResultMeta
+    /**
+     * Record ids this result named. Unlike `hits` and `meta` these can reach
+     * the model again: when the context budget drops the result, they are what
+     * the placeholder keeps, so a conclusion can still cite them.
+     */
+    recordIds?: RecordId[]
 }
 
 export interface ToolContext {

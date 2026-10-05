@@ -4,8 +4,7 @@
  * No orchestration framework: four tools and one while loop do not need one,
  * and every turn has to be accounted for at a granularity a framework would
  * hide. What this file owns is the accounting — turns, tool calls, tokens,
- * cost, latency — because step B feeds exactly that into `llm_traces` and
- * phase 5 reports it.
+ * cost, latency.
  *
  * The exit condition is that the model stopped asking for tools. Turn and
  * tool-call ceilings exist as budget guards, not as the intended way out;
@@ -15,6 +14,8 @@
 import OpenAI from 'openai'
 import { computeCost } from '../config/modelPricing.js'
 import { createLogger } from '../utils/logger.js'
+import { compact, createEstimator, flattenConversation } from './context.js'
+import type { ConversationTurn } from './context.js'
 import { injectedErrorMessage } from './faults.js'
 import type { FaultPlan, FiredFault } from './faults.js'
 import { AGENT_TOOLS } from './tools/definitions.js'
@@ -68,9 +69,9 @@ export interface AgentLogger {
 }
 
 export const SILENT_LOGGER: AgentLogger = {
-    info: () => {},
-    warn: () => {},
-    error: () => {},
+    info: () => { },
+    warn: () => { },
+    error: () => { },
 }
 
 /** Built on first use: `new OpenAI()` throws without an API key, which would
@@ -95,12 +96,20 @@ export interface AgentBudget {
      * over. Unenforceable when the model has no pricing entry.
      */
     maxCostUsd: number
+    /**
+     * Ceiling on the conversation sent with one call. Crossing it compacts the
+     * conversation; a conversation that will not fit even compacted ends the
+     * run the same way an exhausted turn budget does. Set well below the
+     * model's own window, so this limit trips first and stays observable.
+     */
+    maxInputTokens: number
 }
 
 export const DEFAULT_BUDGET: AgentBudget = {
     maxTurns: 6,
     maxToolCalls: 8,
     maxCostUsd: 0.05,
+    maxInputTokens: 120_000,
 }
 
 export type StopReason =
@@ -108,12 +117,20 @@ export type StopReason =
     | 'max_turns'
     | 'max_tool_calls'
     | 'max_cost'
+    | 'max_input_tokens' // the conversation does not fit even after compaction
     | 'incomplete'      // the provider cut the response short — see stopDetail
     | 'aborted'         // cancelled through the caller's signal
 
+const BUDGET_STOPS: readonly StopReason[] = [
+    'max_turns',
+    'max_tool_calls',
+    'max_cost',
+    'max_input_tokens',
+]
+
 /** Budget stops share one exit: force a conclusion instead of failing the run. */
 function isBudgetStop(reason: StopReason): boolean {
-    return reason === 'max_turns' || reason === 'max_tool_calls' || reason === 'max_cost'
+    return BUDGET_STOPS.includes(reason)
 }
 
 export interface ToolCallRecord {
@@ -544,10 +561,14 @@ export async function runAgent({
     const startedAt = Date.now()
     const log = logger ?? createLogger('agent')
 
-    const conversation: InputItem[] = [
+    // Never compacted: the instructions and the evidence being judged.
+    const preamble: InputItem[] = [
         { role: 'developer', content: AGENT_SYSTEM_PROMPT },
         { role: 'user', content: buildEvidenceMessage(input) },
     ]
+    /** The conversation, grouped so compaction can work a whole turn at a time. */
+    let contextTurns: ConversationTurn[] = []
+    const estimator = createEstimator()
 
     const turns: TurnRecord[] = []
     const retrievalHits: RetrievalHit[] = []
@@ -591,8 +612,32 @@ export async function runAgent({
             break
         }
 
+        // Shrinks the conversation when it no longer fits. A conversation that
+        // still does not fit afterwards ends the run through the same forced
+        // convergence the other ceilings use.
+        const fitted = compact({
+            preamble,
+            turns: contextTurns,
+            maxTokens: budget.maxInputTokens,
+            estimate: estimator.estimate,
+        })
+        contextTurns = fitted.turns
+        if (fitted.elided.length > 0 || fitted.droppedReasoning.length > 0) {
+            log.info('context_compacted', {
+                elided: fitted.elided,
+                droppedReasoning: fitted.droppedReasoning,
+                estimatedTokens: fitted.estimatedTokens,
+            })
+        }
+        if (!fitted.withinBudget) {
+            stopReason = 'max_input_tokens'
+            break
+        }
+
         turnIndex += 1
         hooks?.onTurnStart?.(turnIndex)
+
+        const conversation = flattenConversation(preamble, contextTurns)
 
         const call = await callModel({
             client,
@@ -622,7 +667,16 @@ export async function runAgent({
 
         const { parsed, firstTokenMs, latencyMs, incompleteReason, attempts } = call
 
-        conversation.push(...parsed.historyItems)
+        // Corrects the character-to-token ratio from what this call reported,
+        // so the next turn's pre-call estimate tracks the real number.
+        estimator.calibrate(conversation, parsed.inputTokens)
+
+        const contextTurn: ConversationTurn = {
+            turn: turnIndex,
+            items: [...parsed.historyItems],
+            recordIds: [],
+        }
+        contextTurns.push(contextTurn)
 
         const turn: TurnRecord = {
             turn: turnIndex,
@@ -682,6 +736,7 @@ export async function runAgent({
             let ok = false
             let errorCode: ToolErrorCode | undefined
             let resultMeta: ToolResultMeta | undefined
+            let recordIds: string[] | undefined
 
             try {
                 parsedArguments = JSON.parse(call.rawArguments) as unknown
@@ -729,7 +784,7 @@ export async function runAgent({
                         // An injected timeout hangs the handler and lets the real
                         // timeout path end it, rather than faking the error.
                         const handler: ToolHandler = fault?.kind === 'tool-timeout'
-                            ? () => new Promise<ToolOutcome>(() => {})
+                            ? () => new Promise<ToolOutcome>(() => { })
                             : TOOL_HANDLERS[call.name]
 
                         const outcome = await callTool(
@@ -739,6 +794,7 @@ export async function runAgent({
                         )
                         output = outcome.result
                         resultMeta = outcome.meta
+                        recordIds = outcome.recordIds
                         if (outcome.hits) {
                             retrievalHits.push(...outcome.hits)
                         }
@@ -772,11 +828,14 @@ export async function runAgent({
             turn.toolCalls.push(record)
             hooks?.onToolEnd?.(record)
 
-            conversation.push({
+            contextTurn.items.push({
                 type: 'function_call_output',
                 call_id: call.callId,
                 output: JSON.stringify(output),
             })
+            // Kept so compaction can name them after the result itself is gone:
+            // a conclusion still has to cite the records it was drawn from.
+            if (recordIds) contextTurn.recordIds.push(...recordIds)
         }
 
         // Carries the tool-loop break outward.
@@ -793,14 +852,17 @@ export async function runAgent({
     // the model cannot spend another call instead of answering.
     if (isBudgetStop(stopReason)) {
         log.info('budget_reached', { stopReason, turns: turns.length, toolCalls: toolCallCount })
-        conversation.push({ role: 'user', content: CONVERGE_MESSAGE })
         hooks?.onTurnStart?.(turnIndex + 1)
+
+        const convergeInput = flattenConversation(preamble, contextTurns, [
+            { role: 'user', content: CONVERGE_MESSAGE },
+        ])
 
         const call = await callModel({
             client,
             request: {
                 model,
-                input: conversation,
+                input: convergeInput,
                 include: ['reasoning.encrypted_content'],
                 store: false,
                 stream: true,

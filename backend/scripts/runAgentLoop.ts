@@ -15,6 +15,7 @@
  *   npx tsx scripts/runAgentLoop.ts --max-output-tokens 200  # force a truncated turn
  *   npx tsx scripts/runAgentLoop.ts --cancel-after 4000      # cancel mid-run
  *   npx tsx scripts/runAgentLoop.ts --max-cost 0.001    # trip the cost ceiling
+ *   npx tsx scripts/runAgentLoop.ts --max-input-tokens 2000   # force context compaction
  *   npx tsx scripts/runAgentLoop.ts --log               # structured logs alongside the trajectory
  *   npx tsx scripts/runAgentLoop.ts --json              # machine-readable, no streaming
  *   npx tsx scripts/runAgentLoop.ts --no-trace          # skip the llm_traces writes
@@ -73,6 +74,7 @@ const model = arg('model') ?? DEFAULT_MODEL
 const maxTurns = arg('max-turns')
 const maxToolCalls = arg('max-tool-calls')
 const maxCost = arg('max-cost')
+const maxInputTokens = arg('max-input-tokens')
 const maxOutputTokens = arg('max-output-tokens')
 const cancelAfter = arg('cancel-after')
 const toolTimeout = arg('tool-timeout')
@@ -82,6 +84,7 @@ const budget = {
     maxTurns: maxTurns ? Number(maxTurns) : DEFAULT_BUDGET.maxTurns,
     maxToolCalls: maxToolCalls ? Number(maxToolCalls) : DEFAULT_BUDGET.maxToolCalls,
     maxCostUsd: maxCost ? Number(maxCost) : DEFAULT_BUDGET.maxCostUsd,
+    maxInputTokens: maxInputTokens ? Number(maxInputTokens) : DEFAULT_BUDGET.maxInputTokens,
 }
 
 // Off by default, so the trajectory is not interleaved with log lines.

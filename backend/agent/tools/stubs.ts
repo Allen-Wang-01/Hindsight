@@ -187,7 +187,12 @@ export const searchRecords: ToolHandler = async (args): Promise<ToolOutcome> => 
         relatedness: bucket(record.similarity),
     }))
 
-    return { result, hits, meta: { count: scored.length } }
+    return {
+        result,
+        hits,
+        meta: { count: scored.length },
+        recordIds: scored.map(record => record.record_id),
+    }
 }
 
 // ---- get_unit_history ----
@@ -230,7 +235,11 @@ export const getUnitHistory: ToolHandler = async (args): Promise<ToolOutcome> =>
         count: evidence.length,
         evidence,
     }
-    return { result, meta: { count: evidence.length } }
+    return {
+        result,
+        meta: { count: evidence.length },
+        recordIds: evidence.map(entry => entry.record_id),
+    }
 }
 
 // ---- get_topic_distribution ----
@@ -298,7 +307,11 @@ export const getRecord: ToolHandler = async (args): Promise<ToolOutcome> => {
         truncated,
         total_chars: totalChars,
     }
-    return { result, meta: { truncated, totalChars } }
+    return {
+        result,
+        meta: { truncated, totalChars },
+        recordIds: [record.record_id],
+    }
 }
 
 // ---- Registry ----

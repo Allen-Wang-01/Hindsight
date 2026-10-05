@@ -56,7 +56,12 @@ function runIdOf(req: Request): string | null {
  */
 function resolveBudget(body: Record<string, unknown>): AgentBudget | string {
     const budget: AgentBudget = { ...DEFAULT_BUDGET }
-    const fields: Array<keyof AgentBudget> = ['maxTurns', 'maxToolCalls', 'maxCostUsd']
+    const fields: Array<keyof AgentBudget> = [
+        'maxTurns',
+        'maxToolCalls',
+        'maxCostUsd',
+        'maxInputTokens',
+    ]
 
     for (const field of fields) {
         const raw = body[field]
